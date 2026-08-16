@@ -4,7 +4,7 @@
 
 ---
 
-**NAOH: Arcade Collection** is a native PlayStation Vita arcade launcher written in C. It statically links the FB Alpha 2012 (CPS2) and MAME 2000 libretro cores behind a custom `vita2d`-rendered front end, so a curated set of classic arcade games can be launched, played, and saved straight from a single self-contained `.vpk`, no separate RetroArch install required.
+**NAOH: Arcade Collection** is a native PlayStation Vita arcade launcher written in C. It statically links the FB Alpha 2012 (CPS2) and MAME 2000 libretro cores behind a custom `vita2d`-rendered front end, so a set of classic Marvel vs Capcom arcade games can be launched and played.
 
 ## Download & Install
 
