@@ -6,6 +6,11 @@
 
 **NAOH: Arcade Collection** is a native PlayStation Vita arcade launcher written in C. It statically links the FB Alpha 2012 (CPS2) and MAME 2000 libretro cores behind a custom `vita2d`-rendered front end, so a set of classic Marvel vs Capcom arcade games can be launched and played.
 
+> [!WARNING]
+> If you own a PS Vita 1000, it is not recommended to use overlays for extended periods,
+> as static images may cause image retention or burn-in on its OLED display.
+
+
 ## Download & Install
 
 You can download the latest `.vpk` from the [Releases](../../releases) page and install it with VitaShell, same as any other homebrew.
