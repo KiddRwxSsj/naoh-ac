@@ -54,9 +54,10 @@ bool path_mkdir(const char *dir) { (void)dir; return false; }
 #define SCREEN_W 960
 #define SCREEN_H 544
 
-#define SAVE_DIR   "ux0:data/NaohAC/saves"
-#define SYSTEM_DIR "ux0:data/NaohAC/system"
-#define ROM_DIR    "ux0:data/NaohAC/roms/"
+#define SAVE_DIR        "ux0:data/NaohAC/saves"
+#define SYSTEM_DIR      "ux0:data/NaohAC/system"
+#define ROM_DIR         "ux0:data/NaohAC/roms/"
+#define NVRAM_ASSET_DIR "app0:assets/nvram/"
 
 typedef enum {
    CORE_KIND_FBA = 0,
@@ -677,8 +678,10 @@ static int16_t input_state_cb(unsigned port, unsigned device, unsigned index, un
       { RETRO_DEVICE_ID_JOYPAD_B,      SCE_CTRL_CROSS },
       { RETRO_DEVICE_ID_JOYPAD_X,      SCE_CTRL_TRIANGLE },
       { RETRO_DEVICE_ID_JOYPAD_Y,      SCE_CTRL_SQUARE },
-      { RETRO_DEVICE_ID_JOYPAD_L,      SCE_CTRL_L1 },
-      { RETRO_DEVICE_ID_JOYPAD_R,      SCE_CTRL_R1 },
+      { RETRO_DEVICE_ID_JOYPAD_L,      SCE_CTRL_LTRIGGER }, // l1 is heavy punch on the 6 button cps2 layout
+      { RETRO_DEVICE_ID_JOYPAD_R,      SCE_CTRL_RTRIGGER }, // r1 is heavy kick on the 6 button cps2 layout
+      { RETRO_DEVICE_ID_JOYPAD_L2,     SCE_CTRL_LTRIGGER }, // some cps2/mame control schemes read hp off l2 not l
+      { RETRO_DEVICE_ID_JOYPAD_R2,     SCE_CTRL_RTRIGGER }, // same deal for hk on r2 instead of r
       { RETRO_DEVICE_ID_JOYPAD_START,  SCE_CTRL_START },
       { RETRO_DEVICE_ID_JOYPAD_SELECT, SCE_CTRL_SELECT },
    };
@@ -1144,9 +1147,9 @@ static void run_core(void)
       unsigned pressed = (pad.buttons ^ pad_prev.buttons) & pad.buttons;
       pad_prev = pad;
 
-      // start + select pause combo
-      if ((pad.buttons & (SCE_CTRL_SELECT | SCE_CTRL_START)) == (SCE_CTRL_SELECT | SCE_CTRL_START)
-            && (pressed & (SCE_CTRL_SELECT | SCE_CTRL_START)))
+      // select alone opens the pause menu now, free play means we don't
+      // need select free for coin insert anymore
+      if (pressed & SCE_CTRL_SELECT)
       {
          core_audio_port_close();
 
@@ -1206,6 +1209,85 @@ static void create_data_dirs(void)
    sceIoMkdir("ux0:data/NaohAC/system", 0777);
 }
 
+static bool file_exists(const char *path)
+{
+   FILE *f = fopen(path, "rb");
+
+   if (!f)
+      return false;
+
+   fclose(f);
+   return true;
+}
+
+static bool copy_file(const char *src, const char *dst)
+{
+   char buf[4096];
+   size_t n;
+   bool ok = true;
+   FILE *in  = fopen(src, "rb");
+   FILE *out;
+
+   if (!in)
+      return false;
+
+   out = fopen(dst, "wb");
+   if (!out)
+   {
+      fclose(in);
+      return false;
+   }
+
+   while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
+   {
+      if (fwrite(buf, 1, n, out) != n)
+      {
+         ok = false;
+         break;
+      }
+   }
+
+   fclose(in);
+   fclose(out);
+   return ok;
+}
+
+// free play comes from pre configured eeprom nv files bundled as assets,
+// dropped into place on first boot only, existing saves are never touched
+//
+// fba2012 cps2 loads its eeprom straight from save_dir/<romname>.nv, see
+// EEPROMInit in src/burn/devices/eeprom.c, no fs extension, no subfolder
+//
+// mame2000 punisher is left on defaults, no seeding for that core
+static void seed_nvram_files(void)
+{
+   char base[160];
+   char src[192];
+   char dst[192];
+
+   for (unsigned i = 0; i < KNOWN_COUNT; i++)
+   {
+      size_t len;
+      size_t base_len;
+
+      if (known_games[i].core != CORE_KIND_FBA)
+         continue;
+
+      len = strlen(known_games[i].file);
+      base_len = (len > 4) ? len - 4 : len;
+
+      snprintf(base, sizeof(base), "%.*s", (int)base_len, known_games[i].file);
+      snprintf(src, sizeof(src), "%s%s.nv", NVRAM_ASSET_DIR, base);
+      snprintf(dst, sizeof(dst), "%s/%s.nv", SAVE_DIR, base);
+
+      // never overwrite a save the user (or the core) already created
+      if (file_exists(dst))
+         continue;
+
+      copy_file(src, dst);
+   }
+}
+
 int main(int argc, char *argv[])
 {
    (void)argc;
@@ -1216,6 +1298,7 @@ int main(int argc, char *argv[])
    sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
 
    create_data_dirs();
+   seed_nvram_files();
 
    vita2d_init();
    vita2d_set_clear_color(RGBA8(0, 0, 0, 255));
