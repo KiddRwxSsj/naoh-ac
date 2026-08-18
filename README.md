@@ -49,7 +49,7 @@ Optional. Ten slots, named `1.png` through `10.png`. Resolution: **960×544** (f
 
 ## Controls — Pause Menu
  
-Press **SELECT + START** together, at any time during gameplay, to pause. From the pause menu you can:
+Press **SELECT**, at any time during gameplay, to pause. From the pause menu you can:
  
 * **Resume** — close the menu and return to the game.
 * **Options** — switch between **Aspect Ratio** (Fullscreen / 4:3 / 5:4) and cycle through the ten **Overlay** slots (or off). Press ✕ to change the highlighted value, ○ to go back to the main pause screen.
