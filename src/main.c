@@ -140,6 +140,7 @@ typedef struct {
 } retro_core_api_t;
 
 static retro_core_api_t core_api;
+static core_kind_t active_core = CORE_KIND_FBA; // core loaded now, used for l/r remap
 
 extern void fba_retro_set_environment(retro_environment_t);
 extern void fba_retro_set_video_refresh(retro_video_refresh_t);
@@ -678,12 +679,7 @@ static int16_t input_state_cb(unsigned port, unsigned device, unsigned index, un
       { RETRO_DEVICE_ID_JOYPAD_B,      SCE_CTRL_CROSS },
       { RETRO_DEVICE_ID_JOYPAD_X,      SCE_CTRL_TRIANGLE },
       { RETRO_DEVICE_ID_JOYPAD_Y,      SCE_CTRL_SQUARE },
-      { RETRO_DEVICE_ID_JOYPAD_L,      SCE_CTRL_LTRIGGER }, // l1 is heavy punch on the 6 button cps2 layout
-      { RETRO_DEVICE_ID_JOYPAD_R,      SCE_CTRL_RTRIGGER }, // r1 is heavy kick on the 6 button cps2 layout
-      { RETRO_DEVICE_ID_JOYPAD_L2,     SCE_CTRL_LTRIGGER }, // some cps2/mame control schemes read hp off l2 not l
-      { RETRO_DEVICE_ID_JOYPAD_R2,     SCE_CTRL_RTRIGGER }, // same deal for hk on r2 instead of r
       { RETRO_DEVICE_ID_JOYPAD_START,  SCE_CTRL_START },
-      { RETRO_DEVICE_ID_JOYPAD_SELECT, SCE_CTRL_SELECT },
    };
 
    (void)index;
@@ -693,6 +689,29 @@ static int16_t input_state_cb(unsigned port, unsigned device, unsigned index, un
 
    if (device != RETRO_DEVICE_JOYPAD)
       return 0;
+
+   // punisher (mame2000): l/r insert coin, l2/r2 unbound so
+   // the core's service/test menu never triggers
+   if (active_core == CORE_KIND_MAME)
+   {
+      if (id == RETRO_DEVICE_ID_JOYPAD_SELECT)
+         return (pad.buttons & (SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER)) ? 1 : 0;
+
+      if (id == RETRO_DEVICE_ID_JOYPAD_L2 || id == RETRO_DEVICE_ID_JOYPAD_R2)
+         return 0;
+   }
+   else
+   {
+      // fba 6 button cps2 layout, l/l2 heavy punch, r/r2 heavy kick
+      if (id == RETRO_DEVICE_ID_JOYPAD_L || id == RETRO_DEVICE_ID_JOYPAD_L2)
+         return (pad.buttons & SCE_CTRL_LTRIGGER) ? 1 : 0;
+
+      if (id == RETRO_DEVICE_ID_JOYPAD_R || id == RETRO_DEVICE_ID_JOYPAD_R2)
+         return (pad.buttons & SCE_CTRL_RTRIGGER) ? 1 : 0;
+
+      if (id == RETRO_DEVICE_ID_JOYPAD_SELECT)
+         return (pad.buttons & SCE_CTRL_SELECT) ? 1 : 0;
+   }
 
    for (unsigned i = 0; i < sizeof(map) / sizeof(map[0]); i++)
       if (map[i].id == id)
@@ -1319,7 +1338,8 @@ int main(int argc, char *argv[])
 
       stop_menu_music();
 
-      bind_core_api(games[sel].core);
+      active_core = games[sel].core;
+      bind_core_api(active_core);
 
       core_api.set_environment(environment_cb);
       core_api.set_video_refresh(video_refresh_cb);
