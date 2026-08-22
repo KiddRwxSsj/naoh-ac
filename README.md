@@ -21,14 +21,15 @@ You can download the latest `.vpk` from the [Releases](../../releases) page and 
 
 > **English/US versions only.** The bundled cores are matched against specific romsets. Japanese, Asia, or other regional dumps **will not work** — renaming a wrong-region ROM to the filename below does not make it compatible and will cause the game to fail to load or crash the app. Each ROM must be the exact US-region set below, under its exact filename.
 
-| Game                                    | Core               | Required filename   |
-|------------------------------------------|--------------------|----------------------|
-| Marvel Super Heroes (US)                  | FB Alpha 2012 CPS2 | `msh.zip`            |
-| Marvel Super Heroes vs. Street Fighter (US)| FB Alpha 2012 CPS2 | `mshvsf.zip`          |
-| Marvel vs. Capcom (US)                    | FB Alpha 2012 CPS2 | `mvsc.zip`            |
-| X-Men: Children of the Atom (US)          | FB Alpha 2012 CPS2 | `xmcota.zip`          |
-| X-Men vs. Street Fighter (US)             | FB Alpha 2012 CPS2 | `xmvsf.zip`           |
-| The Punisher (US)                         | MAME 2000          | `punisher.zip`        |
+| Game                                              | Region | Reference Version | Core               | Required filename |
+| ------------------------------------------------- | ------ | ----------------: | ------------------ | ----------------- |
+| Marvel Super Heroes (Europe)                      | Europe |            951024 | FB Alpha 2012 CPS2 | `msh.zip`         |
+| Marvel Super Heroes vs. Street Fighter (Europe)   | Europe |            970625 | FB Alpha 2012 CPS2 | `mshvsf.zip`      |
+| Marvel vs. Capcom: Clash of Super Heroes (Europe) | Europe |            980123 | FB Alpha 2012 CPS2 | `mvsc.zip`        |
+| X-Men: Children of the Atom (Europe)              | Europe |            950331 | FB Alpha 2012 CPS2 | `xmcota.zip`      |
+| X-Men vs. Street Fighter (Europe)                 | Europe |            961004 | FB Alpha 2012 CPS2 | `xmvsf.zip`       |
+| The Punisher (Europe)                             | Europe |      Any revision | MAME 2000          | `punisher.zip`    |
+
 
 ## ROM & Asset Setup
 
