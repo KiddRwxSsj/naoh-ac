@@ -19,7 +19,7 @@ You can download the latest `.vpk` from the [Releases](../../releases) page and 
 
 ## Supported Games
 
-> **English/US versions only.** The bundled cores are matched against specific romsets. Japanese, Asia, or other regional dumps **will not work** — renaming a wrong-region ROM to the filename below does not make it compatible and will cause the game to fail to load or crash the app. Each ROM must be the exact US-region set below, under its exact filename.
+> **English/EU versions only.** The bundled cores are matched against specific romsets. Japanese, Asia, or other regional dumps **will not work** — renaming a wrong-region ROM to the filename below does not make it compatible and will cause the game to fail to load or crash the app. Each ROM must be the exact EU-region set below, under its exact filename.
 
 | Game                                              | Region | Reference Version | Core               | Required filename |
 | ------------------------------------------------- | ------ | ----------------: | ------------------ | ----------------- |
@@ -36,7 +36,7 @@ You can download the latest `.vpk` from the [Releases](../../releases) page and 
 All paths are on `ux0:` and are created automatically the first time you run the app, so you can also just copy files in and they'll be picked up.
 
 **ROMs** — `ux0:data/NaohAC/roms/`
-Copy in only the filenames from the table above, exactly as written (lowercase, matching extension). The scanner matches on filename only — it does not verify region — so a `msh.zip` that is secretly a Japanese or Asia dump will still show up in the menu but will fail to run correctly. Only the US-region set for each game is supported.
+Copy in only the filenames from the table above, exactly as written (lowercase, matching extension). The scanner matches on filename only — it does not verify region — so a `msh.zip` that is secretly a Japanese or Asia dump will still show up in the menu but will fail to run correctly. Only the EU-region set for each game is supported.
 
 **Covers** — `ux0:data/NaohAC/covers/`
 Optional. Name each file after its ROM filename with the `.zip` replaced by `.png` (e.g. `msh.zip` → `msh.png`, `mshvsf.zip` → `mshvsf.png`). Resolution: **432×300**.
