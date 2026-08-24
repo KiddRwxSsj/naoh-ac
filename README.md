@@ -19,6 +19,10 @@ You can download the latest `.vpk` from the [Releases](../../releases) page and 
 
 NAOH 2.0 now supports selecting the ROM region (European, USA, or Japanese) and game version directly from the main menu. The bundled cores are matched against specific romsets under exact filenames. 
 
+<p align="center">
+  <img src="screenshots/GameSelection2.0.png" alt="Game Selection"/>
+</p>
+
 | ZIP Filename    | Game                                     | Region | Reference Version |
 | --------------- | ---------------------------------------- | ------ | ----------------- |
 | `msh.zip`       | Marvel Super Heroes                      | Europe | 951024            |
@@ -59,7 +63,7 @@ Optional. Name each file after its ROM filename with the `.zip` replaced by `.pn
 Optional. Ten slots, named `1.png` through `10.png`. Resolution: **960×544** (full screen). Cycle through them in the pause menu; overlays only render in 4:3 or 5:4 aspect mode, where they fill the borders left by the game's native resolution.
 
 <p align="center">
-  <img src="screenshots/mainmenu.png" alt="Menu"/>
+  <img src="screenshots/MainMenu2.0.png" alt="Main Menu"/>
 </p>
 
 ## Features & UI (New in v2.0)
@@ -69,6 +73,10 @@ Optional. Ten slots, named `1.png` through `10.png`. Resolution: **960×544** (f
 * **Visuals:** Added wallpaper opacity settings and different wallpaper effects.
 * **Player Side Selection:** Choose whether you want to play from the Player 1 side or the Player 2 side (Note: this is not multiplayer support, just a side preference).
 * **Error Handling:** Added an error screen to provide context instead of silent crashes.
+
+<p align="center">
+  <img src="screenshots/Settings2.0.png" alt="Settings Menu"/>
+</p>
 
 ## Controls & In-Game Menus
  
