@@ -304,8 +304,25 @@ static SceTouchData touch_front; // front panel only, used for the coin-insert h
 static int audio_port = -1;
 static int core_port_type = 0;
 static int core_port_rate = 0;
-static int16_t audio_stage[AUDIO_PORT_GRAIN * 2];
-static unsigned audio_stage_fill = 0;
+// gameplay audio is decoupled from core_api.run()/blit_frame() via this ring:
+// audio_sample_batch_cb (running on the main thread, inside core_api.run())
+// only ever memcpy's into the ring and never blocks. core_audio_thread_func
+// is the sole place that calls the blocking sceAudioOutOutput, on its own
+// higher-priority thread, so a slow video frame (filter rebake, pause menu
+// teardown, texture alloc) can no longer stall the hardware feed directly.
+// previously a single AUDIO_PORT_GRAIN (~10.7ms) was the only slack in the
+// whole pipeline, which is what produced the mame2000 crackling on real
+// hardware.
+#define CORE_AUDIO_RING_GRAINS 6                                   // ~64ms of slack at 512/48000
+#define CORE_AUDIO_RING_FRAMES (AUDIO_PORT_GRAIN * CORE_AUDIO_RING_GRAINS)
+
+static int16_t            core_audio_ring[CORE_AUDIO_RING_FRAMES * 2];
+static volatile unsigned  core_audio_ring_write = 0;   // touched only by audio_sample_batch_cb
+static volatile unsigned  core_audio_ring_read  = 0;   // touched only by core_audio_thread_func
+static volatile unsigned  core_audio_ring_count = 0;   // touched by both, plain int ops only
+static SceUID             core_audio_thread_id  = -1;
+static volatile bool      core_audio_thread_run = false;
+static SceUID             core_audio_sema       = -1;
 static vita2d_font *font = NULL;
 static vita2d_texture *loading_bg = NULL;
 static bool game_loaded = false;
@@ -316,21 +333,6 @@ static unsigned current_game_idx = 0;
 // game_player_port[] right before the core loads (see main()) and never
 // touched again mid-game
 static unsigned active_player_port = 0;
-
-// consecutive frames the physical start button has been continuously
-// held, tracked once per emulated frame in input_poll_cb (right after
-// update_pad() refreshes pad, so it always reflects this frame's true
-// hold length). the only thing that reads this is the port-0 start
-// bleed carve-out in input_state_cb below
-static unsigned start_hold_frames = 0;
-
-// how long start has to be continuously held before input_state_cb lets
-// it bleed onto port 0 in p2 mode. short enough that a deliberate hold
-// for fba2012's own "hold start" diagnostic combo (which needs port 0's
-// start held for 60+ straight core frames on top of this, see
-// input_state_cb) still clears comfortably, long enough that a normal
-// tap to start a p2 game never reaches port 0 at all
-#define PORT0_START_BLEED_HOLD_FRAMES 20
 
 // true only while warm_up_core() is burning throwaway frames right after
 // load. input_state_cb masks every button while this is set, so whatever
@@ -1180,22 +1182,120 @@ static size_t audio_sample_batch_cb(const int16_t *data, size_t frames)
 
    while (pos < frames)
    {
-      unsigned space = AUDIO_PORT_GRAIN - audio_stage_fill;
-      unsigned take  = (frames - pos < space) ? (unsigned)(frames - pos) : space;
+      unsigned space = CORE_AUDIO_RING_FRAMES - core_audio_ring_count;
 
-      memcpy(audio_stage + audio_stage_fill * 2, data + pos * 2, take * 2 * sizeof(int16_t));
-      audio_stage_fill += take;
+      if (space == 0)
+      {
+         // the audio-out thread fell behind by a full ring's worth of
+         // buffered sound -- drop the oldest grain instead of blocking
+         // retro_run() here. losing a few ms of already-stale audio is
+         // inaudible; stalling emulation to wait on the sound thread is
+         // exactly the coupling that caused the original crackle
+         core_audio_ring_read   = (core_audio_ring_read + AUDIO_PORT_GRAIN) % CORE_AUDIO_RING_FRAMES;
+         core_audio_ring_count -= AUDIO_PORT_GRAIN;
+         space = AUDIO_PORT_GRAIN;
+      }
+
+      unsigned take  = (unsigned)((frames - pos < space) ? (frames - pos) : space);
+      unsigned first = CORE_AUDIO_RING_FRAMES - core_audio_ring_write;
+      if (first > take)
+         first = take;
+
+      memcpy(core_audio_ring + core_audio_ring_write * 2, data + pos * 2,
+            first * 2 * sizeof(int16_t));
+      if (take > first)
+         memcpy(core_audio_ring, data + (pos + first) * 2,
+               (take - first) * 2 * sizeof(int16_t));
+
+      core_audio_ring_write = (core_audio_ring_write + take) % CORE_AUDIO_RING_FRAMES;
+      core_audio_ring_count += take;
       pos += take;
 
-      if (audio_stage_fill == AUDIO_PORT_GRAIN)
-      {
-         if (audio_port >= 0)
-            sceAudioOutOutput(audio_port, audio_stage);
-         audio_stage_fill = 0;
-      }
+      if (core_audio_ring_count >= AUDIO_PORT_GRAIN && core_audio_sema >= 0)
+         sceKernelSignalSema(core_audio_sema, 1);
    }
 
    return frames;
+}
+
+// the sole consumer of the ring above, and the only place gameplay audio
+// still calls the blocking sceAudioOutOutput. runs at a higher priority
+// than the ui sound threads (see core_audio_thread_start) so it always
+// wins the scheduling tie against them for its ~10.7ms hardware deadline
+static int core_audio_thread_func(SceSize args, void *argp)
+{
+   int16_t grain_buf[AUDIO_PORT_GRAIN * 2];
+
+   (void)args;
+   (void)argp;
+
+   while (core_audio_thread_run)
+   {
+      sceKernelWaitSema(core_audio_sema, 1, NULL);
+      if (!core_audio_thread_run)
+         break;
+
+      while (core_audio_ring_count >= AUDIO_PORT_GRAIN && core_audio_thread_run)
+      {
+         unsigned first = CORE_AUDIO_RING_FRAMES - core_audio_ring_read;
+         if (first > AUDIO_PORT_GRAIN)
+            first = AUDIO_PORT_GRAIN;
+
+         memcpy(grain_buf, core_audio_ring + core_audio_ring_read * 2,
+               first * 2 * sizeof(int16_t));
+         if (first < AUDIO_PORT_GRAIN)
+            memcpy(grain_buf + first * 2, core_audio_ring,
+                  (AUDIO_PORT_GRAIN - first) * 2 * sizeof(int16_t));
+
+         core_audio_ring_read   = (core_audio_ring_read + AUDIO_PORT_GRAIN) % CORE_AUDIO_RING_FRAMES;
+         core_audio_ring_count -= AUDIO_PORT_GRAIN;
+
+         if (audio_port >= 0)
+            sceAudioOutOutput(audio_port, grain_buf);
+      }
+   }
+
+   return 0;
+}
+
+static void core_audio_thread_start(void)
+{
+   core_audio_ring_write = 0;
+   core_audio_ring_read  = 0;
+   core_audio_ring_count = 0;
+
+   core_audio_sema = sceKernelCreateSema("core_audio_sema", 0, 0, CORE_AUDIO_RING_GRAINS, NULL);
+   core_audio_thread_run = true;
+
+   // higher priority (lower number) than the ui sound threads' 0x10000100
+   // (see announcer_thread_id/sfx_thread_id/music_thread_id) -- this is the
+   // one thread with a real hardware deadline every grain and it must not
+   // lose a scheduling tie against a menu stinger
+   core_audio_thread_id = sceKernelCreateThread("core_audio_out",
+         core_audio_thread_func, 0x10000100 - 0x20, 0x10000, 0, 0, NULL);
+
+   if (core_audio_thread_id >= 0)
+      sceKernelStartThread(core_audio_thread_id, 0, NULL);
+   else
+      core_audio_thread_run = false;
+}
+
+static void core_audio_thread_stop(void)
+{
+   if (core_audio_thread_id >= 0)
+   {
+      core_audio_thread_run = false;
+      sceKernelSignalSema(core_audio_sema, 1);
+      sceKernelWaitThreadEnd(core_audio_thread_id, NULL, NULL);
+      sceKernelDeleteThread(core_audio_thread_id);
+      core_audio_thread_id = -1;
+   }
+
+   if (core_audio_sema >= 0)
+   {
+      sceKernelDeleteSema(core_audio_sema);
+      core_audio_sema = -1;
+   }
 }
 
 // analog range is 0-255, center ~128. press and release sit at different
@@ -1269,14 +1369,6 @@ static void input_poll_cb(void)
 {
    update_pad();
    update_touch();
-
-   // see PORT0_START_BLEED_HOLD_FRAMES / input_state_cb: this has to stay
-   // in lockstep with the core's own per-frame input snapshot, so it's
-   // updated here rather than off pad state read anywhere else
-   if (pad.buttons & SCE_CTRL_START)
-      start_hold_frames++;
-   else
-      start_hold_frames = 0;
 }
 
 // -1 isn't a real retropad joypad id (they're all 0 and up), safe to use
@@ -1414,8 +1506,8 @@ static bool action_pressed(int action_id)
 // can't spawn a character or hold the game open waiting on it - unlike
 // a real "P1 vs P2" credit split, where both sides get properly coined
 // and started, this is what actually keeps this a true single-player
-// side switch. the one place that used to undermine this is the start
-// carve-out right below - see PORT0_START_BLEED_HOLD_FRAMES
+// side switch. p2 has no diagnostic-menu access - anything not on
+// active_player_port is a hard no-op, port 0 included
 static int16_t input_state_cb(unsigned port, unsigned device, unsigned index, unsigned id)
 {
    (void)index;
@@ -1431,70 +1523,9 @@ static int16_t input_state_cb(unsigned port, unsigned device, unsigned index, un
    if (device != RETRO_DEVICE_JOYPAD)
       return 0;
 
-   // fbalpha2012's diagnostic hold combo polls start on a hardcoded
-   // port 0 no matter which port the game itself is actually fed on
-   // (see environment_cb's fbneo-diagnostic-input handling, which always
-   // answers "hold start" for whichever diagnostic-input key a given fba
-   // build asks for). confirmed against fba2012_neogeo's own libretro.cpp:
-   // the combo checker always reads input_cb(0, RETRO_DEVICE_JOYPAD, 0,
-   // diag_input[...]) regardless of which port is actually playing, and
-   // "hold start" needs that port-0 read to stay pressed for more than
-   // 60 straight core frames (diag_input_hold_frame_delay) before the
-   // combo actually fires. in p2 mode our physical start only otherwise
-   // answers on active_player_port, so without some carve-out here the
-   // core's port 0 check would always read start as unpressed and the
-   // hold could never fire at all.
-   //
-   // this used to just forward start to port 0 unconditionally, which
-   // was the actual cause of the p1/p2 bug: a plain tap to start a p2
-   // game reads as pressed on port 0 for those same frames, and that's
-   // plenty for the game's own driver logic (not fba's diagnostic
-   // checker, the arcade ROM code itself) to register a genuine p1
-   // start/credit event and open a real two-player game, exactly like
-   // pressing both start buttons on a real cabinet would. holding start
-   // for PORT0_START_BLEED_HOLD_FRAMES before ever letting it reach
-   // port 0 fixes that: an ordinary tap-to-start (a handful of frames)
-   // never reaches port 0 at all now, so p1 never gets coined or
-   // started and stays genuinely disconnected, while a deliberate hold
-   // still clears this gate quickly enough that fba2012's own longer
-   // 60-frame timer still has time to fire afterward
-   if (port == 0 && id == RETRO_DEVICE_ID_JOYPAD_START && active_player_port != 0
-         && start_hold_frames > PORT0_START_BLEED_HOLD_FRAMES)
-      return (pad.buttons & SCE_CTRL_START) ? 1 : 0;
-
-   // fba2012/mame2000's own dip switch/test menu is drawn and read
-   // entirely inside the core, and every driver checked reads its
-   // navigation off a hardcoded port 0, same as the diagnostic combo
-   // itself does for start just above. trying to track exactly when
-   // that menu is open from out here was too fragile, so in p2 mode
-   // the d-pad and every standard action button just mirror onto
-   // port 0 unconditionally instead, menu open or not - which exact
-   // button a given driver reads for confirm/toggle inside its own
-   // dipswitch screen isn't consistent across cores, so all of them
-   // go through rather than guessing one. port 0 never sees a coin
-   // or a real start in p2 mode (see the start carve-out above), so
-   // the driver never claims it for actual gameplay - a stray
-   // direction or button on an uncredited, unclaimed port is a no-op
-   // during real play, and a working cursor/confirm the moment the
-   // menu is actually up
-   if (port == 0 && active_player_port != 0)
-   {
-      switch (id)
-      {
-         case RETRO_DEVICE_ID_JOYPAD_UP:    return (pad.buttons & SCE_CTRL_UP)    ? 1 : 0;
-         case RETRO_DEVICE_ID_JOYPAD_DOWN:  return (pad.buttons & SCE_CTRL_DOWN)  ? 1 : 0;
-         case RETRO_DEVICE_ID_JOYPAD_LEFT:  return (pad.buttons & SCE_CTRL_LEFT)  ? 1 : 0;
-         case RETRO_DEVICE_ID_JOYPAD_RIGHT: return (pad.buttons & SCE_CTRL_RIGHT) ? 1 : 0;
-         case RETRO_DEVICE_ID_JOYPAD_A: return action_pressed(RETRO_DEVICE_ID_JOYPAD_A) ? 1 : 0;
-         case RETRO_DEVICE_ID_JOYPAD_B: return action_pressed(RETRO_DEVICE_ID_JOYPAD_B) ? 1 : 0;
-         case RETRO_DEVICE_ID_JOYPAD_X: return action_pressed(RETRO_DEVICE_ID_JOYPAD_X) ? 1 : 0;
-         case RETRO_DEVICE_ID_JOYPAD_Y: return action_pressed(RETRO_DEVICE_ID_JOYPAD_Y) ? 1 : 0;
-         case RETRO_DEVICE_ID_JOYPAD_L: return action_pressed(RETRO_DEVICE_ID_JOYPAD_L) ? 1 : 0;
-         case RETRO_DEVICE_ID_JOYPAD_R: return action_pressed(RETRO_DEVICE_ID_JOYPAD_R) ? 1 : 0;
-         default: break;
-      }
-   }
-
+   // p2 never forwards anything to port 0 - a genuine p1 start/credit on
+   // an uncredited port is exactly what spawned p1 into p2's game. p2
+   // simply has no diagnostic-menu access
    if (port != active_player_port)
       return 0;
 
@@ -2560,11 +2591,6 @@ static void warm_up_core(int frames)
       core_api.run();
    core_warming_up = false;
    needs_var_update = true;
-
-   // whatever was held going into/through warmup (most likely start,
-   // from picking the game in our own menu) shouldn't count toward the
-   // port-0 start bleed gate - real gameplay starts counting fresh
-   start_hold_frames = 0;
 
    debug_log("WARMUP: done");
 }
@@ -4287,10 +4313,15 @@ static void core_audio_port_open(void)
 
    if (audio_port >= 0)
       sceAudioOutSetVolume(audio_port, SCE_AUDIO_VOLUME_FLAG_L_CH | SCE_AUDIO_VOLUME_FLAG_R_CH, vol);
+
+   core_audio_thread_start();
 }
 
 static void core_audio_port_close(void)
 {
+   // stop pulling from the ring before the port it writes to goes away
+   core_audio_thread_stop();
+
    if (audio_port >= 0)
    {
       sceAudioOutReleasePort(audio_port);
@@ -4323,7 +4354,6 @@ static void run_core(void)
             break;
 
          core_audio_port_open();
-         audio_stage_fill = 0;
 
          // flush here, not a bare memset like the entry above -- whichever
          // button just closed the pause menu (circle, or cross on resume)
@@ -5118,7 +5148,6 @@ static void run_offline_play(void)
             : SCE_AUDIO_OUT_PORT_TYPE_VOICE;
 
       core_audio_port_open();
-      audio_stage_fill = 0;
 
       // --- run: play until the player exits back to the menu ---
 
