@@ -58,13 +58,16 @@ All paths are on `ux0:` and are created automatically the first time you run the
 * **ROMs** — `ux0:data/NaohAC/roms/`
 Copy in only the filenames from the table above, exactly as written (lowercase, matching extension). 
 * **Covers** — `ux0:data/NaohAC/covers/`
-Optional. Name each file after its ROM filename with the `.zip` replaced by `.png` (e.g. `msh.zip` → `msh.png`, `mshvsf.zip` → `mshvsf.png`). Resolution: **432×300**.
+Optional. Name each file after its ROM filename with the `.zip` replaced by `.png` (e.g. `msh.zip` → `msh.png`, `mshvsf.zip` → `mshvsf.png`). Resolution must be **432×300**.
 * **Overlays** — `ux0:data/NaohAC/overlays/`
-Optional. Ten slots, named `1.png` through `10.png`. Resolution: **960×544** (full screen). Cycle through them in the pause menu; overlays only render in 4:3 or 5:4 aspect mode, where they fill the borders left by the game's native resolution.
+Optional. Ten slots, named `1.png` through `10.png`. Resolution must be **960×544** (full screen). Cycle through them in the pause menu; overlays only render in 4:3 or 5:4 aspect mode, where they fill the borders left by the game's native resolution.
 
-<p align="center">
-  <img src="screenshots/MainMenu2.0.png" alt="Main Menu"/>
-</p>
+**Asset Templates:**
+Use the images in the `templates/` folder of this repository as sizing guides.
+
+| Cover Art (432×300) | Overlay (960×544) |
+| :---: | :---: |
+| <img src="templates/templatecoverart.png" width="220"/> | <img src="templates/templateoverlay.png" width="220"/> |
 
 ## Features & UI (New in v2.0)
 * **Authentic Interface:** The UI, pause menu, terminology, and overall layout have been heavily reworked to be as similar as possible to MVCC.
