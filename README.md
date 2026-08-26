@@ -78,7 +78,7 @@ Use the images in the `templates/` folder of this repository as sizing guides.
 * **Error Handling:** Added an error screen to provide context instead of silent crashes.
 
 <p align="center">
-  <img src="screenshots/Settings2.0.png" alt="Settings Menu"/>
+  <img src="screenshots/MainMenu2.0.png" alt="Settings Menu"/>
 </p>
 
 ## Controls & In-Game Menus
@@ -91,6 +91,10 @@ Use the images in the `templates/` folder of this repository as sizing guides.
     * **Exit** — close the running game and return to the launcher grid.
 * **Insert Coin:** You can use **Touch input** on the screen to insert a coin. This is particularly useful for *The Punisher*, which lacks a Free Play mode.
 * **Dip Switches:** Hold **START** to open the dip switches menu. This allows you to change game difficulty and other internal arcade settings, and these changes will be saved.
+
+<p align="center">
+  <img src="screenshots/Settings2.0.png" alt="Settings Menu"/>
+</p>
 
 ## Credits
 
