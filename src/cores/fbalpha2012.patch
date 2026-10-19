@@ -1,0 +1,416 @@
+diff --git a/svn-current/trunk/src/burn/devices/eeprom.cpp b/svn-current/trunk/src/burn/devices/eeprom.cpp
+index e4e476e..c048d9b 100644
+--- a/svn-current/trunk/src/burn/devices/eeprom.cpp
++++ b/svn-current/trunk/src/burn/devices/eeprom.cpp
+@@ -80,6 +80,14 @@ void EEPROMInit(const eeprom_interface *interface)
+ 	}
+ 
+ 	memset(eeprom_data,0xff,(1 << intf->address_bits) * intf->data_bits / 8);
++
++	// the serial state below is all statics, so whatever the previously
++	// loaded game left in it used to leak into this game's first eeprom
++	// read. that's enough to make two boots of the same rom diverge
++	memset(serial_buffer, 0, sizeof(serial_buffer));
++	eeprom_data_bits = 0;
++	eeprom_clock_count = 0;
++	reset_delay = 0;
+ 	serial_count = 0;
+ 	latch = 0;
+ 	reset_line = EEPROM_ASSERT_LINE;
+diff --git a/svn-current/trunk/src/burn/drv/capcom/cps.h b/svn-current/trunk/src/burn/drv/capcom/cps.h
+index d93a3f8..362e5e1 100644
+--- a/svn-current/trunk/src/burn/drv/capcom/cps.h
++++ b/svn-current/trunk/src/burn/drv/capcom/cps.h
+@@ -299,6 +299,8 @@ void QsndReset();
+ void QsndNewFrame();
+ void QsndEndFrame();
+ void QsndSyncZ80();
++void QsndPublish();
++void QsndHoldZ80();
+ INT32 QsndScan(INT32 nAction);
+ 
+ // qs_z.cpp
+diff --git a/svn-current/trunk/src/burn/drv/capcom/cps_mem.cpp b/svn-current/trunk/src/burn/drv/capcom/cps_mem.cpp
+index 831b020..8da1026 100644
+--- a/svn-current/trunk/src/burn/drv/capcom/cps_mem.cpp
++++ b/svn-current/trunk/src/burn/drv/capcom/cps_mem.cpp
+@@ -138,6 +138,8 @@ void __fastcall CPSQSoundC0WriteByte(UINT32 sekAddress, UINT8 byteValue)
+ 	// Sync only when the last byte of the sound command is written
+ 	if (sekAddress == 0x001F) {
+ 		QsndSyncZ80();
++	} else {
++		QsndHoldZ80();								// the z80 may be on its own thread
+ 	}
+ #else
+ 	QsndSyncZ80();
+@@ -174,6 +176,8 @@ void __fastcall CPSQSoundF0WriteByte(UINT32 sekAddress, UINT8 byteValue)
+ 	// Sync only when the last byte of the sound command is written
+ 	if (sekAddress == 0x001F) {
+ 		QsndSyncZ80();
++	} else {
++		QsndHoldZ80();								// the z80 may be on its own thread
+ 	}
+ #else
+ 	QsndSyncZ80();
+diff --git a/svn-current/trunk/src/burn/drv/capcom/cps_run.cpp b/svn-current/trunk/src/burn/drv/capcom/cps_run.cpp
+index d4e595a..66e30a2 100644
+--- a/svn-current/trunk/src/burn/drv/capcom/cps_run.cpp
++++ b/svn-current/trunk/src/burn/drv/capcom/cps_run.cpp
+@@ -439,11 +439,13 @@ INT32 Cps2Frame()
+ 
+ 	if (nIrqCycles < nCpsCycles * nFirstLine / nCpsNumScanlines) {
+ 		SekRun(nIrqCycles);
++		QsndPublish();
+ 		DoIRQ();
+ 	}
+ 	nNext = nCpsCycles * nFirstLine / nCpsNumScanlines;
+ 	if (SekTotalCycles() < nNext) {
+ 		SekRun(nNext - SekTotalCycles());
++		QsndPublish();
+ 	}
+ 
+ 	CopyCpsReg(0);										// Get inititial copy of registers
+@@ -460,9 +462,11 @@ INT32 Cps2Frame()
+ 
+ 		while (nNext > nIrqCycles && nInterrupt < MAX_RASTER) {
+ 			SekRun(nIrqCycles - SekTotalCycles());
++			QsndPublish();
+ 			DoIRQ();
+ 		}
+ 		SekRun(nNext - SekTotalCycles());				// run cpu
++		QsndPublish();									// the z80 catches up on its own core meanwhile
+ 	}
+ 	
+ 	CpsObjGet();										// Get objects
+diff --git a/svn-current/trunk/src/burn/drv/capcom/qs.cpp b/svn-current/trunk/src/burn/drv/capcom/qs.cpp
+index 3bb00e2..3e1555e 100644
+--- a/svn-current/trunk/src/burn/drv/capcom/qs.cpp
++++ b/svn-current/trunk/src/burn/drv/capcom/qs.cpp
+@@ -3,6 +3,210 @@
+ 
+ static INT32 nQsndCyclesExtra;
+ 
++// cps2 only: the z80 (and the qsound mixing it drives) runs on a thread of
++// its own, on another core on the vita, while the 68k carries on with the
++// frame. the z80 is only ever let run up to where the 68k has already been
++// (QsndPublish after every SekRun in Cps2Frame), and anything the 68k does
++// to the shared ram first waits for the thread to go idle and then syncs
++// right here like before, so the z80 never sees a 68k write early or late.
++//
++// where a z80 run stops does matter (BurnTimerUpdate rounds through timer
++// ticks, a split can move the frame's last instruction by a few cycles), so
++// every published point gets run to, in order, through a small queue, and
++// without the thread the same points get run to right here. the machine
++// then comes out identical whether the thread exists or not and however
++// the two threads happen to interleave, which online play depends on.
++//
++// every publish posts the worker exactly once and the worker counts every
++// one it handled, so "idle" means all of them are done and nothing is left
++// queued that could start the z80 behind our back
++
++#if defined(VITA)
++#include <psp2/kernel/threadmgr.h>
++#include <psp2/kernel/cpu.h>
++
++typedef SceUID QsndSema;
++
++static bool QsndSemaInit(QsndSema *s, const char *name) { *s = sceKernelCreateSema(name, 0, 0, 0x7FFFFFFF, NULL); return *s >= 0; }
++static void QsndSemaFree(QsndSema *s) { sceKernelDeleteSema(*s); }
++static void QsndSemaPost(QsndSema *s) { sceKernelSignalSema(*s, 1); }
++static void QsndSemaWait(QsndSema *s) { sceKernelWaitSema(*s, 1, NULL); }
++
++static SceUID nQsndThreadId = -1;
++#else
++#include <pthread.h>
++#include <semaphore.h>
++#include <stdlib.h>
++#include <unistd.h>
++
++typedef sem_t QsndSema;
++
++static bool QsndSemaInit(QsndSema *s, const char *) { return sem_init(s, 0, 0) == 0; }
++static void QsndSemaFree(QsndSema *s) { sem_destroy(s); }
++static void QsndSemaPost(QsndSema *s) { sem_post(s); }
++static void QsndSemaWait(QsndSema *s) { while (sem_wait(s) != 0) { } }
++
++static pthread_t QsndPthread;
++#endif
++
++#define QSND_QUEUE 64						// power of two
++
++static bool bQsndThread = false;
++static volatile bool bQsndQuit;
++static INT32 nQsndTarget;					// last published point, 68k side only
++static INT32 nQsndQueue[QSND_QUEUE];		// z80 cycles to run to, in order
++static volatile UINT32 nQsndPosted;			// queued, 68k side
++static volatile UINT32 nQsndHandled;		// run, worker side
++static QsndSema QsndWork, QsndDone;
++
++static void QsndWorker()
++{
++#if !defined(VITA)
++	// harness only: shake the timing up to prove it doesn't matter
++	bool bJitter = getenv("QSND_JITTER") != NULL;
++	UINT32 nSeed = 12345;
++#endif
++
++	for (;;) {
++		QsndSemaWait(&QsndWork);
++		if (__atomic_load_n(&bQsndQuit, __ATOMIC_ACQUIRE)) {
++			break;
++		}
++
++#if !defined(VITA)
++		if (bJitter) {
++			nSeed = nSeed * 1103515245 + 12345;
++			usleep((nSeed >> 16) % 300);
++		}
++#endif
++
++		(void)__atomic_load_n(&nQsndPosted, __ATOMIC_ACQUIRE);	// pairs with the release in QsndPublish
++		INT32 nTarget = nQsndQueue[nQsndHandled % QSND_QUEUE];
++		if (nTarget > ZetTotalCycles()) {
++			BurnTimerUpdate(nTarget);
++		}
++
++		__atomic_store_n(&nQsndHandled, nQsndHandled + 1, __ATOMIC_RELEASE);
++		QsndSemaPost(&QsndDone);
++	}
++}
++
++#if defined(VITA)
++static int QsndThreadEntry(SceSize, void *) { QsndWorker(); return 0; }
++#else
++static void *QsndThreadEntry(void *) { QsndWorker(); return NULL; }
++#endif
++
++static void QsndThreadStart()
++{
++	bQsndThread = false;
++	bQsndQuit = false;
++	nQsndTarget = 0;
++	nQsndPosted = 0;
++	nQsndHandled = 0;
++
++#if !defined(VITA)
++	if (getenv("QSND_NO_THREAD")) {
++		return;
++	}
++#endif
++
++	if (!QsndSemaInit(&QsndWork, "qsnd_work")) {
++		return;
++	}
++	if (!QsndSemaInit(&QsndDone, "qsnd_done")) {
++		QsndSemaFree(&QsndWork);
++		return;
++	}
++
++#if defined(VITA)
++	// user core 1: the game runs on 0 and the online relay sits on 2
++	nQsndThreadId = sceKernelCreateThread("qsound_z80", QsndThreadEntry, 0x10000100, 0x40000, 0,
++		SCE_KERNEL_CPU_MASK_USER_1, NULL);
++	if (nQsndThreadId >= 0 && sceKernelStartThread(nQsndThreadId, 0, NULL) < 0) {
++		sceKernelDeleteThread(nQsndThreadId);
++		nQsndThreadId = -1;
++	}
++	bQsndThread = nQsndThreadId >= 0;
++#else
++	bQsndThread = pthread_create(&QsndPthread, NULL, QsndThreadEntry, NULL) == 0;
++#endif
++
++	if (!bQsndThread) {
++		QsndSemaFree(&QsndWork);
++		QsndSemaFree(&QsndDone);
++	}
++}
++
++// waits until the worker has handled every wake it was given and is
++// parked again, after that the z80 is ours
++static void QsndHold()
++{
++	if (!bQsndThread) {
++		return;
++	}
++
++	while (__atomic_load_n(&nQsndHandled, __ATOMIC_ACQUIRE) != nQsndPosted) {
++		QsndSemaWait(&QsndDone);
++	}
++}
++
++static void QsndThreadStop()
++{
++	if (!bQsndThread) {
++		return;
++	}
++
++	QsndHold();
++	__atomic_store_n(&bQsndQuit, true, __ATOMIC_RELEASE);
++	QsndSemaPost(&QsndWork);
++
++#if defined(VITA)
++	sceKernelWaitThreadEnd(nQsndThreadId, NULL, NULL);
++	sceKernelDeleteThread(nQsndThreadId);
++	nQsndThreadId = -1;
++#else
++	pthread_join(QsndPthread, NULL);
++#endif
++
++	QsndSemaFree(&QsndWork);
++	QsndSemaFree(&QsndDone);
++	bQsndThread = false;
++}
++
++// the 68k has run up to here, the z80 may catch up to it in the background
++void QsndPublish()
++{
++	INT32 nCycles = (INT64)SekTotalCycles() * nCpsZ80Cycles / nCpsCycles;
++	if (nCycles <= nQsndTarget) {
++		return;
++	}
++	nQsndTarget = nCycles;
++
++	if (!bQsndThread) {
++		if (nCycles > ZetTotalCycles()) {
++			BurnTimerUpdate(nCycles);
++		}
++		return;
++	}
++
++	// queue full: wait for the worker to make room, never drop a point
++	while (nQsndPosted - __atomic_load_n(&nQsndHandled, __ATOMIC_ACQUIRE) >= QSND_QUEUE) {
++		QsndSemaWait(&QsndDone);
++	}
++
++	nQsndQueue[nQsndPosted % QSND_QUEUE] = nCycles;
++	__atomic_store_n(&nQsndPosted, nQsndPosted + 1, __ATOMIC_RELEASE);
++	QsndSemaPost(&QsndWork);
++}
++
++// for the 68k writes that skip the sync (the sound command speedhack in
++// cps_mem.cpp): they still can't land while the worker is running the z80
++void QsndHoldZ80()
++{
++	QsndHold();
++}
++
+ static INT32 qsndTimerOver(INT32, INT32)
+ {
+ //	bprintf(PRINT_NORMAL, _T("  - IRQ -> 1.\n"));
+@@ -37,6 +241,10 @@ INT32 QsndInit()
+ 
+ 	QscInit(nRate);		// Init QSound chip
+ 
++	if (Cps == 2) {
++		QsndThreadStart();
++	}
++
+ 	return 0;
+ }
+ 
+@@ -57,6 +265,7 @@ void QsndReset()
+ 
+ void QsndExit()
+ {
++	QsndThreadStop();
+ 	QscExit();							// Exit QSound chip
+ 	QsndZExit();
+ }
+@@ -79,10 +288,14 @@ void QsndNewFrame()
+ 	ZetIdle(nQsndCyclesExtra);
+ 
+ 	QscNewFrame();
++
++	nQsndTarget = 0;
+ }
+ 
+ void QsndEndFrame()
+ {
++	QsndHold();
++
+ 	BurnTimerEndFrame(nCpsZ80Cycles);
+ 	if (pBurnSoundOut) QscUpdate(nBurnSoundLen);
+ 
+@@ -94,9 +307,15 @@ void QsndSyncZ80()
+ {
+ 	int nCycles = (INT64)SekTotalCycles() * nCpsZ80Cycles / nCpsCycles;
+ 
++	QsndHold();
++
+ 	if (nCycles <= ZetTotalCycles()) {
+ 		return;
+ 	}
+ 
+ 	BurnTimerUpdate(nCycles);
++
++	if (nCycles > nQsndTarget) {
++		nQsndTarget = nCycles;
++	}
+ }
+diff --git a/svn-current/trunk/src/burn/drv/capcom/qs_c.cpp b/svn-current/trunk/src/burn/drv/capcom/qs_c.cpp
+index 6f0b90b..368c9a8 100644
+--- a/svn-current/trunk/src/burn/drv/capcom/qs_c.cpp
++++ b/svn-current/trunk/src/burn/drv/capcom/qs_c.cpp
+@@ -131,8 +131,22 @@ void QscSetRoute(INT32 nIndex, double nVolume, INT32 nRouteDir)
+ 
+ INT32 QscScan(INT32 nAction)
+ {
++	INT8* pSavedBank[16];
++
++	// PlayBank is a raw host pointer, rebuilt by MapBank() on load anyway.
++	// Writing it out as NULL keeps states byte-identical between runs, which
++	// netplay relies on to check both sides booted into the same machine
++	for (INT32 i = 0; i < 16; i++) {
++		pSavedBank[i] = QChan[i].PlayBank;
++		if (nAction & ACB_READ) QChan[i].PlayBank = NULL;
++	}
++
+ 	SCAN_VAR(QChan);
+ 
++	if (nAction & ACB_READ) {
++		for (INT32 i = 0; i < 16; i++) QChan[i].PlayBank = pSavedBank[i];
++	}
++
+ 	if (nAction & ACB_WRITE) {
+ 		// Update bank pointers with new banks, and recalc nAdvance
+ 		for (INT32 i = 0; i < 16; i++) {
+diff --git a/svn-current/trunk/src/cpu/m68000_intf.cpp b/svn-current/trunk/src/cpu/m68000_intf.cpp
+index cc542ca..d60fc5c 100644
+--- a/svn-current/trunk/src/cpu/m68000_intf.cpp
++++ b/svn-current/trunk/src/cpu/m68000_intf.cpp
+@@ -1143,6 +1143,20 @@ void SekReset()
+ #endif
+ 
+ #ifdef EMU_M68K
++		// musashi's reset only loads sp, pc and sr. the general registers,
++		// the banked stack pointers and the prefetch/ir leftovers all keep
++		// whatever the last game running on this core left behind, so two
++		// boots of the same rom stopped matching. zero them instead
++		static const m68k_register_t stale[] = {
++			M68K_REG_USP, M68K_REG_ISP, M68K_REG_MSP,
++			M68K_REG_PREF_ADDR, M68K_REG_PREF_DATA, M68K_REG_PPC, M68K_REG_IR
++		};
++		for (INT32 r = M68K_REG_D0; r <= M68K_REG_A6; r++) {
++			m68k_set_reg((m68k_register_t)r, 0);
++		}
++		for (UINT32 i = 0; i < sizeof(stale) / sizeof(stale[0]); i++) {
++			m68k_set_reg(stale[i], 0);
++		}
+ 		m68k_pulse_reset();
+ #endif
+ 
+diff --git a/svn-current/trunk/src/cpu/z80_intf.cpp b/svn-current/trunk/src/cpu/z80_intf.cpp
+index 2bddc1a..5d5d071 100644
+--- a/svn-current/trunk/src/cpu/z80_intf.cpp
++++ b/svn-current/trunk/src/cpu/z80_intf.cpp
+@@ -551,6 +551,10 @@ void ZetReset()
+ 	if (nOpenedCPU == -1) bprintf(PRINT_ERROR, _T("ZetReset called when no CPU open\n"));
+ #endif
+ 
++	// scratch address register, never reset and saved in every state
++	EA = 0;
++	if (nOpenedCPU >= 0 && nOpenedCPU < MAX_Z80) Z80EA[nOpenedCPU] = 0;
++
+ 	Z80Reset();
+ }
+ 

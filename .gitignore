@@ -1,0 +1,12 @@
+*.o
+*.a
+*.elf
+*.velf
+*.vpk
+eboot.bin
+param.sfo
+src/cores/fbalpha2012/
+src/cores/mame2000/
+src/deps/vitaGL/
+tools/netplay-harness/build/
+tools/netplay-harness/runs/

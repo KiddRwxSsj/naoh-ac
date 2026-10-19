@@ -1,0 +1,415 @@
+diff --git a/src/mame.c b/src/mame.c
+index 6daf751..8906392 100644
+--- a/src/mame.c
++++ b/src/mame.c
+@@ -665,6 +665,202 @@ static int vh_open(void)
+ 
+ int need_to_clear_bitmap;	/* set by the user interface */
+ 
++/***************************************************************************
++
++  Drawing on another core. A driver that can draw a frame from a copy of
++  its video state (cps1) asks for it in vh_start. Then at every vblank the
++  game thread waits for the previous frame's drawing to finish, shows it,
++  copies the video state for this frame and lets the worker draw that into
++  the other bitmap while the cpus run the next frame. The screen is one
++  frame behind the emulation, the emulation itself never changes: drawing
++  only reads the copy and writes its own bitmap/palette/caches, and the
++  game thread only touches those while the worker is idle.
++
++***************************************************************************/
++
++#if defined(VITA)
++#include <psp2/kernel/threadmgr.h>
++#include <psp2/kernel/cpu.h>
++
++typedef SceUID render_sema;
++static int render_sema_init(render_sema *s, const char *name) { *s = sceKernelCreateSema(name, 0, 0, 0x7FFFFFFF, NULL); return *s >= 0; }
++static void render_sema_free(render_sema *s) { sceKernelDeleteSema(*s); }
++static void render_sema_post(render_sema *s) { sceKernelSignalSema(*s, 1); }
++static void render_sema_wait(render_sema *s) { sceKernelWaitSema(*s, 1, NULL); }
++static SceUID render_thread_id = -1;
++#else
++#include <pthread.h>
++#include <semaphore.h>
++
++typedef sem_t render_sema;
++static int render_sema_init(render_sema *s, const char *name) { (void)name; return sem_init(s, 0, 0) == 0; }
++static void render_sema_free(render_sema *s) { sem_destroy(s); }
++static void render_sema_post(render_sema *s) { sem_post(s); }
++static void render_sema_wait(render_sema *s) { while (sem_wait(s) != 0) { } }
++static pthread_t render_pthread;
++#endif
++
++static void (*render_snapshot)(void);
++static int render_on;
++static struct osd_bitmap *render_bitmap[2];	/* [0] is the one vh_open made */
++static int render_back;						/* the one the worker draws into */
++static struct osd_bitmap *render_target;
++static int render_full;
++static volatile int render_quit;
++static volatile unsigned render_posted, render_handled;
++static render_sema render_work, render_done;
++
++void mame_render_thread_request(void (*snapshot)(void))
++{
++	render_snapshot = snapshot;
++}
++
++static void render_worker(void)
++{
++	for (;;)
++	{
++		render_sema_wait(&render_work);
++		if (__atomic_load_n(&render_quit, __ATOMIC_ACQUIRE))
++			break;
++
++		(void)__atomic_load_n(&render_posted, __ATOMIC_ACQUIRE);
++		(*Machine->drv->vh_update)(render_target, render_full);
++
++		__atomic_store_n(&render_handled, render_handled + 1, __ATOMIC_RELEASE);
++		render_sema_post(&render_done);
++	}
++}
++
++#if defined(VITA)
++static int render_entry(SceSize args, void *argp) { (void)args; (void)argp; render_worker(); return 0; }
++#else
++static void *render_entry(void *arg) { (void)arg; render_worker(); return NULL; }
++#endif
++
++static void render_wait(void)
++{
++	while (__atomic_load_n(&render_handled, __ATOMIC_ACQUIRE) != render_posted)
++		render_sema_wait(&render_done);
++}
++
++static void render_thread_start(void)
++{
++	struct osd_bitmap *front = Machine->scrbitmap;
++
++	render_on = 0;
++	if (!render_snapshot || artwork_overlay || !front)
++		return;
++#if !defined(VITA)
++	if (getenv("MAME_RENDER_THREAD") && !strcmp(getenv("MAME_RENDER_THREAD"), "0"))
++		return;
++#endif
++
++	render_bitmap[0] = front;
++	render_bitmap[1] = osd_alloc_bitmap(front->width, front->height, front->depth);
++	if (!render_bitmap[1])
++		return;
++	osd_clearbitmap(render_bitmap[1]);
++
++	render_quit = 0;
++	render_posted = render_handled = 0;
++	if (!render_sema_init(&render_work, "mame_render_work"))
++		goto fail_bitmap;
++	if (!render_sema_init(&render_done, "mame_render_done"))
++		goto fail_work;
++
++#if defined(VITA)
++	/* user core 1, the game keeps core 0 */
++	render_thread_id = sceKernelCreateThread("mame_render", render_entry, 0x10000100, 0x40000, 0,
++			SCE_KERNEL_CPU_MASK_USER_1, NULL);
++	if (render_thread_id >= 0 && sceKernelStartThread(render_thread_id, 0, NULL) < 0)
++	{
++		sceKernelDeleteThread(render_thread_id);
++		render_thread_id = -1;
++	}
++	if (render_thread_id < 0)
++		goto fail_done;
++#else
++	if (pthread_create(&render_pthread, NULL, render_entry, NULL) != 0)
++		goto fail_done;
++#endif
++
++	/* the worker draws into [1] first, [0] (blank) is on screen meanwhile */
++	render_back = 1;
++	render_on = 1;
++	return;
++
++fail_done:
++	render_sema_free(&render_done);
++fail_work:
++	render_sema_free(&render_work);
++fail_bitmap:
++	osd_free_bitmap(render_bitmap[1]);
++	render_bitmap[1] = NULL;
++}
++
++static void render_thread_stop(void)
++{
++	if (!render_on)
++		return;
++
++	render_wait();
++	__atomic_store_n(&render_quit, 1, __ATOMIC_RELEASE);
++	render_sema_post(&render_work);
++#if defined(VITA)
++	sceKernelWaitThreadEnd(render_thread_id, NULL, NULL);
++	sceKernelDeleteThread(render_thread_id);
++	render_thread_id = -1;
++#else
++	pthread_join(render_pthread, NULL);
++#endif
++	render_sema_free(&render_work);
++	render_sema_free(&render_done);
++
++	/* vh_close frees whatever Machine->scrbitmap is, give it its own back */
++	Machine->scrbitmap = render_bitmap[0];
++	real_scrbitmap = render_bitmap[0];
++	osd_free_bitmap(render_bitmap[1]);
++	render_bitmap[1] = NULL;
++	render_on = 0;
++}
++
++static int updatescreen_threaded(void)
++{
++	/* last frame's drawing is done: that's what goes on screen now */
++	render_wait();
++	Machine->scrbitmap = real_scrbitmap = render_bitmap[render_back];
++	render_back ^= 1;
++
++	if (handle_user_interface(real_scrbitmap))
++		return 1;
++
++	update_video_and_audio();
++
++	/* this frame's video state, taken before the eof callback buffers the
++	   sprites for the next one, same order as drawing it right here */
++	(*render_snapshot)();
++	if (bitmap_dirty)
++		overlay_remap();
++
++	if (drv->vh_eof_callback) (*drv->vh_eof_callback)();
++
++	render_target = render_bitmap[render_back];
++
++	/* osd_clearbitmap() marks bitmap_dirty, so it happens here, not on the
++	   worker */
++	if (need_to_clear_bitmap)
++	{
++		osd_clearbitmap(render_target);
++		need_to_clear_bitmap = 0;
++	}
++	render_full = bitmap_dirty;
++	bitmap_dirty = 0;
++
++	__atomic_store_n(&render_posted, render_posted + 1, __ATOMIC_RELEASE);
++	render_sema_post(&render_work);
++	return 0;
++}
++
+ int updatescreen(void)
+ {
+ 	/* Substitute silence for sound_update() while the game is paused:
+@@ -678,6 +874,9 @@ int updatescreen(void)
+ 	else
+ 		sound_update();
+ 
++	if (render_on)
++		return updatescreen_threaded();
++
+ 	if (osd_skip_this_frame() == 0)
+ 	{
+ 		profiler_mark(PROFILER_VIDEO);
+@@ -794,6 +993,7 @@ static int run_machine_init(void)
+ 	rm_state = 3;
+ 
+ 	real_scrbitmap = artwork_overlay ? overlay_real_scrbitmap : Machine->scrbitmap;
++	render_thread_start();
+ 
+ 	/* free memory regions allocated with REGIONFLAG_DISPOSE (typically gfx roms) */
+ 	{
+@@ -868,6 +1068,8 @@ static void run_machine_exit(void)
+ 		/* save input ports settings */
+ 		save_input_port_settings();
+ 	}
++	render_thread_stop();
++	render_snapshot = NULL;
+ 	if (rm_state >= 3) sound_stop();
+ 	if (rm_state >= 2 && drv->vh_stop) (*drv->vh_stop)();
+ 	if (rm_state >= 1)
+diff --git a/src/mame.h b/src/mame.h
+index bd8ec16..6c27636 100644
+--- a/src/mame.h
++++ b/src/mame.h
+@@ -130,6 +130,9 @@ void mame_run_one_frame(void);
+ void mame_end_game(void);
+ int updatescreen(void);
+ void draw_screen(int bitmap_dirty);
++/* a driver whose vh_update only reads what snapshot() copies can have its
++   screen drawn on another core, see mame.c */
++void mame_render_thread_request(void (*snapshot)(void));
+ void update_video_and_audio(void);
+ /* osd_fopen() must use this to know if high score files can be used */
+ int mame_highscore_enabled(void);
+diff --git a/src/vidhrdw/cps1.c b/src/vidhrdw/cps1.c
+index 36e7c9e..7dd2e89 100644
+--- a/src/vidhrdw/cps1.c
++++ b/src/vidhrdw/cps1.c
+@@ -267,11 +267,24 @@ static void cps1_init_machine(void)
+ #endif
+ }
+ 
++/* what the renderer reads. normally the live registers/ram/sprite buffer;
++   when the screen is drawn on another thread (see mame.c) they point at
++   copies taken at vblank, so the cpus can carry on writing the real ones */
++static unsigned char *render_output;
++static unsigned char *render_gfxram;
++static unsigned char *render_obj;
++static unsigned char *snap_output;
++static unsigned char *snap_gfxram;
++static unsigned char *snap_obj;
++
+ static INLINE int cps1_port(int offset)
+ {
+-	return READ_WORD(&cps1_output[offset]);
++	return READ_WORD(&render_output[offset]);
+ }
+ 
++void cps1_vh_screenrefresh(struct osd_bitmap *bitmap,int full_refresh);
++void cps1_render_snapshot(void);
++
+ static INLINE unsigned char *cps1_base(int offset,int boundary)
+ {
+ 	int base=cps1_port(offset)*256;
+@@ -284,7 +297,7 @@ static INLINE unsigned char *cps1_base(int offset,int boundary)
+ 	Mask out the irrelevant bits.
+ 	*/
+ 	base &= ~(boundary-1);
+- 	return &cps1_gfxram[base&0x3ffff];
++ 	return &render_gfxram[base&0x3ffff];
+ }
+ 
+ 
+@@ -929,6 +942,9 @@ int cps1_vh_start(void)
+ {
+ 	int i;
+ 
++	render_output = cps1_output;
++	render_gfxram = cps1_gfxram;
++
+ 	cps1_init_machine();
+ 
+ 	if (cps1_gfx_start())
+@@ -966,6 +982,18 @@ int cps1_vh_start(void)
+ 		return -1;
+ 	}
+ 	memset(cps1_buffered_obj, 0x00, cps1_obj_size);
++	render_obj = cps1_buffered_obj;
++
++	/* cps2 in this file has its own sprites, only plain cps1 can be drawn
++	   from the copies below */
++	if (Machine->drv->vh_update == cps1_vh_screenrefresh)
++	{
++		snap_output = (unsigned char *)malloc(cps1_output_size);
++		snap_gfxram = (unsigned char *)malloc(cps1_gfxram_size);
++		snap_obj = (unsigned char *)malloc(cps1_obj_size);
++		if (snap_output && snap_gfxram && snap_obj)
++			mame_render_thread_request(cps1_render_snapshot);
++	}
+ 
+ 	memset(cps1_gfxram, 0, cps1_gfxram_size);   /* Clear GFX RAM */
+ 	memset(cps1_output, 0, cps1_output_size);   /* Clear output ports */
+@@ -1012,6 +1040,10 @@ void cps1_vh_stop(void)
+ 		free(cps1_scroll2_old);
+ 	if (cps1_buffered_obj)
+ 		free(cps1_buffered_obj);
++	free(snap_output);
++	free(snap_gfxram);
++	free(snap_obj);
++	snap_output = snap_gfxram = snap_obj = NULL;
+ 	cps1_gfx_stop();
+ }
+ 
+@@ -1208,7 +1240,7 @@ void cps1_find_last_sprite(void)    /* Find the offset of last sprite */
+ 	/* Locate the end of table marker */
+ 	while (offset < cps1_obj_size)
+ 	{
+-		int colour=READ_WORD(&cps1_buffered_obj[offset]);
++		int colour=READ_WORD(&render_obj[offset]);
+ 		if (colour == 0xff00)
+ 		{
+ 			/* Marker found. This is the last sprite. */
+@@ -1228,13 +1260,13 @@ void cps1_palette_sprites(unsigned short *base)
+ 
+ 	for (i=cps1_last_sprite_offset; i>=0; i-=8)
+ 	{
+-		int x=READ_WORD(&cps1_buffered_obj[i]);
+-		int y=READ_WORD(&cps1_buffered_obj[i+2]);
++		int x=READ_WORD(&render_obj[i]);
++		int y=READ_WORD(&render_obj[i+2]);
+ 		if (x && y)
+ 		{
+-			int colour=READ_WORD(&cps1_buffered_obj[i+6]);
++			int colour=READ_WORD(&render_obj[i+6]);
+ 			int col=colour&0x1f;
+-			unsigned int code=READ_WORD(&cps1_buffered_obj[i+4]);
++			unsigned int code=READ_WORD(&render_obj[i+4]);
+ 			if (cps1_game_config->kludge == 7)
+ 			{
+ 				code += 0x4000;
+@@ -1331,12 +1363,12 @@ void cps1_render_sprites(struct osd_bitmap *bitmap)
+ 	/* Draw the sprites */
+ 	for (i=cps1_last_sprite_offset; i>=0; i-=8)
+ 	{
+-		int x=READ_WORD(&cps1_buffered_obj[i]);
+-		int y=READ_WORD(&cps1_buffered_obj[i+2]);
++		int x=READ_WORD(&render_obj[i]);
++		int y=READ_WORD(&render_obj[i+2]);
+ 		if (x && y )
+ 		{
+-			unsigned int code=READ_WORD(&cps1_buffered_obj[i+4]);
+-			int colour=READ_WORD(&cps1_buffered_obj[i+6]);
++			unsigned int code=READ_WORD(&render_obj[i+4]);
++			int colour=READ_WORD(&render_obj[i+6]);
+ 			int col=colour&0x1f;
+ 
+ 			y &= 0x1ff;
+@@ -1847,7 +1879,7 @@ void cps1_vh_screenrefresh(struct osd_bitmap *bitmap,int full_refresh)
+ 		memset(cps1_scroll2_old, 0xff, cps1_scroll2_size);
+ 	}
+ 
+-	layercontrol = READ_WORD(&cps1_output[cps1_game_config->layer_control]);
++	layercontrol = READ_WORD(&render_output[cps1_game_config->layer_control]);
+ 
+ 	distort_scroll2 = videocontrol & 0x01;
+ 
+@@ -1931,14 +1963,30 @@ void cps1_vh_screenrefresh(struct osd_bitmap *bitmap,int full_refresh)
+ #endif
+ }
+ 
+-void cps1_eof_callback(void)
++/* main thread at vblank, while the drawing thread is idle: copy everything
++   cps1_vh_screenrefresh reads and point the renderer at the copies */
++void cps1_render_snapshot(void)
+ {
+-	/* Get video memory base registers */
+-	cps1_get_video_base();
++	memcpy(snap_output, cps1_output, cps1_output_size);
++	memcpy(snap_gfxram, cps1_gfxram, cps1_gfxram_size);
++	memcpy(snap_obj, cps1_buffered_obj, cps1_obj_size);
++
++	render_output = snap_output;
++	render_gfxram = snap_gfxram;
++	render_obj = snap_obj;
++}
+ 
++void cps1_eof_callback(void)
++{
+ 	/* Mish: 181099: Buffer sprites for next frame - the hardware must do
+ 		this at the end of vblank */
+-	memcpy(cps1_buffered_obj,cps1_obj,cps1_obj_size);
++	/* straight from the live registers: the renderer's base pointers may
++	   belong to the drawing thread right now, and it works them out again
++	   itself before every frame anyway */
++	int base = READ_WORD(&cps1_output[CPS1_OBJ_BASE]) * 256;
++
++	base &= ~(cps1_obj_size - 1);
++	memcpy(cps1_buffered_obj, &cps1_gfxram[base & 0x3ffff], cps1_obj_size);
+ }
+ 
+ 

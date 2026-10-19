@@ -1,15 +1,15 @@
 # Third-Party Notices
 
-The original source in this repository (`main.c`, `Makefile`, build scripts) is licensed under the zlib license — see `LICENSE`. That license is permissive, including for commercial use, but it only covers code written for this project. The compiled `.vpk` you build or distribute statically links two third-party libretro cores whose licenses are more restrictive than zlib and which override the permissiveness of zlib for the resulting binary. Read this in full before publishing a release.
+The original source in this repository (`main.c`, `gfx.c`, `netplay.c`, `mqtt.c`, `rng.c`, `Makefile`, build scripts, the core patches) is licensed under the zlib license — see `LICENSE`. That license is permissive, including for commercial use, but it only covers code written for this project. The compiled `.vpk` you build or distribute statically links two third-party libretro cores whose licenses are more restrictive than zlib and which override the permissiveness of zlib for the resulting binary. Read this in full before publishing a release.
 
 ## 1. Emulator cores (non-commercial — governs the whole binary)
 
-**FB Alpha 2012 CPS2 (`cores/fbalpha2012_cps2`)**
-Source: https://github.com/libretro/fbalpha2012_cps2 
+**FB Alpha 2012 (`cores/fbalpha2012`, fetched by `cores/fetch.sh` and patched with `cores/fbalpha2012.patch`)**
+Source: https://github.com/libretro/fbalpha2012 
 License: Non-Commercial (FinalBurn/FB Alpha license).
 Copyright (c) 2001 Dave (formerly of finalburn.com), all rights reserved. You can use, modify and redistribute this code freely as long as you don't do so commercially. This copyright notice must remain with the code. If your program uses this code, you must either distribute or link to the source code. You may not distribute FB Alpha with ROM images unless you have the legal right to distribute them. You may not ask for donations to support your work on any project that uses the FB Alpha source code.
 
-**MAME 2000 (`cores/mame2000`)**
+**MAME 2000 (`cores/mame2000`, fetched by `cores/fetch.sh` and patched with `cores/mame2000.patch`)**
 Source: https://github.com/libretro/mame2000-libretro 
 License: Non-Commercial (original MAME license, pre-GPL relicensing) — freeware, non-commercial use only, source must remain available.
 
@@ -32,10 +32,27 @@ License: free for any use including commercial, credit not required. You may not
 
 Public domain (Sean Barrett / nothings). No restrictions.
 
-## 5. ROMs — not included
+## 5. vitaGL
+
+Source: https://github.com/Rinnegatamante/vitaGL (cloned and built by the Makefile)
+License: GNU LGPL v3. It's statically linked, so anyone distributing the `.vpk` must keep it possible to relink against a modified vitaGL. Since the full source of this project and the exact vitaGL commit are public, rebuilding with `make` covers that.
+
+## 6. Mbed TLS (`deps/mbedtls`)
+
+Copyright The Mbed TLS Contributors. License: Apache-2.0 (chosen from its Apache-2.0 OR GPL-2.0-or-later dual license), see `deps/mbedtls/LICENSE`. Vendored from 3.6.7 with only a config override (`naohac_mbedtls_config.h`) added.
+
+## 7. Monocypher (`deps/monocypher`)
+
+Copyright Loup Vaillant and contributors. Dual-licensed BSD-2-Clause / CC0, see `deps/monocypher/LICENCE.md`.
+
+## 8. NVRAM files (`assets/nvram/*.nv`)
+
+Settings files for the supported games, set up for Free Play and normal difficulty. They also give both players identical starting state for online play. They contain no ROM data.
+
+## 9. ROMs — not included
 
 This repository and every release do not contain, and will never contain, arcade ROM files. `naoh_arcade_collection` only scans `ux0:data/NaohAC/roms/` on the user's own memory card at runtime and displays entries for ROMs it recognizes (Marvel Super Heroes, Marvel Super Heroes vs. Street Fighter, Marvel vs. Capcom, X-Men: Children of the Atom, X-Men vs. Street Fighter, The Punisher). Users must supply ROM files they legally own. The listed titles are trademarks/copyrights of Capcom and their respective owners; nothing in this repo grants rights to them.
 
-## 6. Cover art
+## 10. Cover art
 
 Not bundled in this repository or any release. If you personally add box-art images to `ux0:data/NaohAC/covers/` at runtime, they remain the property of their respective publishers and are used solely for game identification.

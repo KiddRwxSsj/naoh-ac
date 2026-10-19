@@ -7,12 +7,14 @@
 #include <psp2/touch.h>
 #include <psp2/audioout.h>
 #include <psp2/power.h>
-#include <psp2/gxm.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/cpu.h>
 #include <psp2/io/stat.h>
 #include <psp2/io/fcntl.h>
-#include <vita2d.h>
+#include "gfx.h"
+#include "netplay.h"
+#include <zlib.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <math.h>
@@ -83,6 +85,7 @@ static bool file_exists(const char *path);
 #define SCREEN_H 544
 
 #define SAVE_DIR        "ux0:data/NaohAC/saves"
+#define ONLINE_SAVE_DIR "ux0:data/NaohAC/saves/online"
 #define SYSTEM_DIR      "ux0:data/NaohAC/system"
 #define ROM_DIR         "ux0:data/NaohAC/roms/"
 #define CONFIG_DIR      "ux0:data/NaohAC/configs"
@@ -288,9 +291,9 @@ static void bind_core_api(core_kind_t core)
 
 #define WALLPAPER_COUNT 11 // off + 10 overlay images (ux0:data/NaohAC/overlays/1..10.png)
 
-static vita2d_texture *frame_tex = NULL;
+static gfx_texture *frame_tex = NULL;
 static int current_overlay = 0; // persisted per-game, see game_config_t below
-static vita2d_texture *overlay_tex = NULL;
+static gfx_texture *overlay_tex = NULL;
 static unsigned tex_w = 0;
 static unsigned tex_h = 0;
 
@@ -316,15 +319,22 @@ static int core_port_rate = 0;
 #define CORE_AUDIO_RING_GRAINS 6                                   // ~64ms of slack at 512/48000
 #define CORE_AUDIO_RING_FRAMES (AUDIO_PORT_GRAIN * CORE_AUDIO_RING_GRAINS)
 
+// the two threads sit on different cores, so each index has exactly one
+// writer and gets handed over with release/acquire. there's no shared
+// counter any more (a += on one core and a -= on the other could lose an
+// update and leave the ring thinking it was fuller or emptier than it was):
+// the fill level is just write - read. the indices count modulo twice the
+// ring size so a full ring and an empty one don't look the same
+#define CORE_AUDIO_RING_WRAP   (CORE_AUDIO_RING_FRAMES * 2)
+
 static int16_t            core_audio_ring[CORE_AUDIO_RING_FRAMES * 2];
-static volatile unsigned  core_audio_ring_write = 0;   // touched only by audio_sample_batch_cb
-static volatile unsigned  core_audio_ring_read  = 0;   // touched only by core_audio_thread_func
-static volatile unsigned  core_audio_ring_count = 0;   // touched by both, plain int ops only
+static volatile unsigned  core_audio_ring_write = 0;   // written only by audio_sample_batch_cb
+static volatile unsigned  core_audio_ring_read  = 0;   // written only by core_audio_thread_func
 static SceUID             core_audio_thread_id  = -1;
 static volatile bool      core_audio_thread_run = false;
 static SceUID             core_audio_sema       = -1;
-static vita2d_font *font = NULL;
-static vita2d_texture *loading_bg = NULL;
+static gfx_font *font = NULL;
+static gfx_texture *loading_bg = NULL;
 static bool game_loaded = false;
 static unsigned current_game_idx = 0;
 
@@ -352,6 +362,17 @@ static bool core_warming_up = false;
 // so the first real read of fbneo-diagnostic-input happens against clean
 // post warmup input instead of whatever was still held at launch
 static bool needs_var_update = false;
+
+// where the cores read and write their nvram/eeprom. online matches point
+// this at a scratch folder that gets reset to the bundled factory files
+// before every boot, so both vitas start from the exact same machine and
+// a match never touches anyone's offline settings or high scores
+static const char *core_save_dir = SAVE_DIR;
+
+// set for the length of an online match. input_state_cb stops reading
+// the pad directly and serves both ports from the netplay input queue
+// instead, so the two vitas always feed the core the exact same frames
+static bool netplay_active = false;
 
 #define FONT_BASE_PX   16
 
@@ -771,56 +792,56 @@ static void free_filter_tex(void);
 
 // baked once in load_vignette_pulse_tex, see the crt/vignette baking code
 // further down for how it's built and used
-static vita2d_texture *vignette_pulse_tex = NULL;
+static gfx_texture *vignette_pulse_tex = NULL;
 
 // baked once in load_spotlight_tex, a soft circular white glow scaled and
 // tinted at draw time over whichever cover sits in the front-center slot.
 // see draw_carousel_spotlight further down
 #define SPOTLIGHT_TEX_SIZE 256
-static vita2d_texture *spotlight_tex = NULL;
+static gfx_texture *spotlight_tex = NULL;
 
-static vita2d_texture *menu_backdrop_tex = NULL; // full-screen bg, app0:assets/backgrounds/bg_menu.png
-static vita2d_texture *cover_tex[KNOWN_COUNT];
+static gfx_texture *menu_backdrop_tex = NULL; // full-screen bg, app0:assets/backgrounds/bg_menu.png
+static gfx_texture *cover_tex[KNOWN_COUNT];
 
 // title screen chrome, shown once at boot before the main menu (see
 // run_title_screen further down)
-static vita2d_texture *title_bg_tex     = NULL; // app0:assets/backgrounds/title_bg.png, 1080x1440
-static vita2d_texture *title_logo_tex   = NULL; // app0:assets/screens/title/logo.png, 622x331
-static vita2d_texture *title_banner_tex = NULL; // app0:assets/screens/title/presstostart.png, 480x52
+static gfx_texture *title_bg_tex     = NULL; // app0:assets/backgrounds/title_bg.png, 1080x1440
+static gfx_texture *title_logo_tex   = NULL; // app0:assets/screens/title/logo.png, 622x331
+static gfx_texture *title_banner_tex = NULL; // app0:assets/screens/title/presstostart.png, 480x52
 
 // main menu chrome, shown between the title screen and the game
 // carousel (see run_main_menu further down)
-static vita2d_texture *mainmenu_bg_tex = NULL; // app0:assets/backgrounds/mainmenu.png
+static gfx_texture *mainmenu_bg_tex = NULL; // app0:assets/backgrounds/mainmenu.png
 
 // baked pause menu chrome, see app0:assets/ui/panels/pause_*.png. the
 // photo backdrop (pause_photo_tex) lives under backgrounds/ instead, it's
 // shared with the carousel/main menu bottom bars and info panel, not
 // pause-specific despite the filename
-static vita2d_texture *pause_frame_tex   = NULL;
-static vita2d_texture *pause_ribbon_tex  = NULL;
-static vita2d_texture *pause_hilite_tex  = NULL;
-static vita2d_texture *pause_photo_tex   = NULL; // app0:assets/backgrounds/pausemenubg.png
+static gfx_texture *pause_frame_tex   = NULL;
+static gfx_texture *pause_ribbon_tex  = NULL;
+static gfx_texture *pause_hilite_tex  = NULL;
+static gfx_texture *pause_photo_tex   = NULL; // app0:assets/backgrounds/pausemenubg.png
 
 // select-game menu chrome, see app0:assets/ui/panels/menu_*.png and
 // app0:assets/ui/icons/btn_*.png
-static vita2d_texture *menu_header_tex = NULL;
-static vita2d_texture *info_frame_tex  = NULL;
-static vita2d_texture *btn_tri_tex     = NULL;
-static vita2d_texture *btn_sq_tex      = NULL;
-static vita2d_texture *btn_cross_tex   = NULL;
-static vita2d_texture *btn_circ_tex    = NULL;
+static gfx_texture *menu_header_tex = NULL;
+static gfx_texture *info_frame_tex  = NULL;
+static gfx_texture *btn_tri_tex     = NULL;
+static gfx_texture *btn_sq_tex      = NULL;
+static gfx_texture *btn_cross_tex   = NULL;
+static gfx_texture *btn_circ_tex    = NULL;
 
 // controller settings overlay chrome, see
 // app0:assets/ui/panels/settings_banner.png. same 480x52 size as the
 // pause menu's red ribbon (pause_ribbon_tex) so it drops into the same
 // header slot without any extra scaling math
-static vita2d_texture *settings_banner_tex = NULL;
+static gfx_texture *settings_banner_tex = NULL;
 
 // modal confirmation dialog chrome, see
 // app0:assets/ui/panels/warningbg.png. drawn stretched to whatever w/h
 // show_prompt asks for (see draw_prompt_box), same stand-in-stretch
 // convention draw_panel_box already uses for its own frame art
-static vita2d_texture *prompt_bg_tex = NULL;
+static gfx_texture *prompt_bg_tex = NULL;
 
 // staggered card layout: slots 0-2 back row (small), 3-5 front row (big)
 static const int slot_x[KNOWN_COUNT] = { 239, 405, 571, 194, 390, 586 };
@@ -865,14 +886,25 @@ typedef struct { unsigned i; float x, y, w, h; } slot_draw_t;
 
 typedef enum { MENU_FOCUS_GAMES, MENU_FOCUS_VERSION, MENU_FOCUS_PLAYER } menu_focus_t;
 
+// true while the carousel is being used to pick a game for online play.
+// the side you play on isn't a choice there (host is p1, guest is p2), so
+// the player row turns into a plain label and focus skips over it
+static bool carousel_online = false;
+
+// online, which versions of each game the player actually has a rom for
+// (bit per region). looked up once when online play opens instead of
+// poking the memory card every frame the carousel or room list redraws
+static unsigned char online_owned[KNOWN_COUNT];
+static const char *region_short[REGION_COUNT] = { "English", "Japanese", "European" };
+
 // frees a texture and clears the pointer, no-op if already NULL. shared
 // by every one-off texture cleanup below so the free+null pair only has
 // to be written once
-static void free_tex_ptr(vita2d_texture **tex)
+static void free_tex_ptr(gfx_texture **tex)
 {
    if (*tex)
    {
-      vita2d_free_texture(*tex);
+      gfx_free_texture(*tex);
       *tex = NULL;
    }
 }
@@ -881,35 +913,35 @@ static void load_menu_assets(void)
 {
    char path[160];
 
-   menu_backdrop_tex = vita2d_load_PNG_file("app0:assets/backgrounds/bg_menu.png");
+   menu_backdrop_tex = gfx_load_png("app0:assets/backgrounds/bg_menu.png");
 
-   title_bg_tex     = vita2d_load_PNG_file("app0:assets/backgrounds/title_bg.png");
-   title_logo_tex   = vita2d_load_PNG_file("app0:assets/screens/title/logo.png");
-   title_banner_tex = vita2d_load_PNG_file("app0:assets/screens/title/presstostart.png");
+   title_bg_tex     = gfx_load_png("app0:assets/backgrounds/title_bg.png");
+   title_logo_tex   = gfx_load_png("app0:assets/screens/title/logo.png");
+   title_banner_tex = gfx_load_png("app0:assets/screens/title/presstostart.png");
 
-   mainmenu_bg_tex = vita2d_load_PNG_file("app0:assets/backgrounds/mainmenu.png");
+   mainmenu_bg_tex = gfx_load_png("app0:assets/backgrounds/mainmenu.png");
 
-   pause_frame_tex  = vita2d_load_PNG_file("app0:assets/ui/panels/pause_frame.png");
-   pause_ribbon_tex = vita2d_load_PNG_file("app0:assets/ui/panels/pause_ribbon.png");
-   pause_hilite_tex = vita2d_load_PNG_file("app0:assets/ui/panels/pause_highlight.png");
-   pause_photo_tex  = vita2d_load_PNG_file("app0:assets/backgrounds/pausemenubg.png");
+   pause_frame_tex  = gfx_load_png("app0:assets/ui/panels/pause_frame.png");
+   pause_ribbon_tex = gfx_load_png("app0:assets/ui/panels/pause_ribbon.png");
+   pause_hilite_tex = gfx_load_png("app0:assets/ui/panels/pause_highlight.png");
+   pause_photo_tex  = gfx_load_png("app0:assets/backgrounds/pausemenubg.png");
 
-   menu_header_tex = vita2d_load_PNG_file("app0:assets/ui/panels/menu_header.png");
-   info_frame_tex  = vita2d_load_PNG_file("app0:assets/ui/panels/menu_infopanel_frame.png");
-   btn_tri_tex     = vita2d_load_PNG_file("app0:assets/ui/icons/btn_triangle.png");
-   btn_sq_tex      = vita2d_load_PNG_file("app0:assets/ui/icons/btn_square.png");
-   btn_cross_tex   = vita2d_load_PNG_file("app0:assets/ui/icons/btn_cross.png");
-   btn_circ_tex    = vita2d_load_PNG_file("app0:assets/ui/icons/btn_circle.png");
+   menu_header_tex = gfx_load_png("app0:assets/ui/panels/menu_header.png");
+   info_frame_tex  = gfx_load_png("app0:assets/ui/panels/menu_infopanel_frame.png");
+   btn_tri_tex     = gfx_load_png("app0:assets/ui/icons/btn_triangle.png");
+   btn_sq_tex      = gfx_load_png("app0:assets/ui/icons/btn_square.png");
+   btn_cross_tex   = gfx_load_png("app0:assets/ui/icons/btn_cross.png");
+   btn_circ_tex    = gfx_load_png("app0:assets/ui/icons/btn_circle.png");
 
-   settings_banner_tex = vita2d_load_PNG_file("app0:assets/ui/panels/settings_banner.png");
-   prompt_bg_tex        = vita2d_load_PNG_file("app0:assets/ui/panels/warningbg.png");
+   settings_banner_tex = gfx_load_png("app0:assets/ui/panels/settings_banner.png");
+   prompt_bg_tex        = gfx_load_png("app0:assets/ui/panels/warningbg.png");
 
    // cache cover textures in ram, keyed off base_id so european/american/
    // japanese variants of the same game always share one cover
    for (unsigned i = 0; i < KNOWN_COUNT; i++)
    {
       snprintf(path, sizeof(path), "ux0:data/NaohAC/covers/%s.png", known_games[i].base_id);
-      cover_tex[i] = vita2d_load_PNG_file(path);
+      cover_tex[i] = gfx_load_png(path);
    }
 
    load_vignette_pulse_tex();
@@ -1092,7 +1124,7 @@ static bool environment_cb(unsigned cmd, void *data)
          // loaded fine, punisheru/punisherj (clones) hit it on every
          // load and got rejected outright on the double slash. both
          // cores get the no-trailing-slash form now
-         *(const char **)data = SAVE_DIR;
+         *(const char **)data = core_save_dir;
          return true;
 
       case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY:
@@ -1176,44 +1208,38 @@ static void audio_sample_cb(int16_t left, int16_t right)
    (void)right;
 }
 
+static unsigned core_audio_ring_fill(unsigned write, unsigned read)
+{
+   return (write + CORE_AUDIO_RING_WRAP - read) % CORE_AUDIO_RING_WRAP;
+}
+
 static size_t audio_sample_batch_cb(const int16_t *data, size_t frames)
 {
-   size_t pos = 0;
+   unsigned write = core_audio_ring_write;
+   unsigned read  = __atomic_load_n(&core_audio_ring_read, __ATOMIC_ACQUIRE);
+   unsigned space = CORE_AUDIO_RING_FRAMES - core_audio_ring_fill(write, read);
+   unsigned take  = (frames < space) ? (unsigned)frames : space;
+   unsigned at    = write % CORE_AUDIO_RING_FRAMES;
+   unsigned first = CORE_AUDIO_RING_FRAMES - at;
 
-   while (pos < frames)
-   {
-      unsigned space = CORE_AUDIO_RING_FRAMES - core_audio_ring_count;
+   // the audio-out thread fell behind by a full ring's worth of buffered
+   // sound: whatever doesn't fit gets dropped instead of blocking
+   // retro_run() here, stalling emulation on the sound thread is exactly
+   // the coupling that caused the original crackle. it's the newest
+   // samples that go, the read index is the audio thread's and it may be
+   // copying out of the old ones right now
+   if (first > take)
+      first = take;
 
-      if (space == 0)
-      {
-         // the audio-out thread fell behind by a full ring's worth of
-         // buffered sound -- drop the oldest grain instead of blocking
-         // retro_run() here. losing a few ms of already-stale audio is
-         // inaudible; stalling emulation to wait on the sound thread is
-         // exactly the coupling that caused the original crackle
-         core_audio_ring_read   = (core_audio_ring_read + AUDIO_PORT_GRAIN) % CORE_AUDIO_RING_FRAMES;
-         core_audio_ring_count -= AUDIO_PORT_GRAIN;
-         space = AUDIO_PORT_GRAIN;
-      }
+   memcpy(core_audio_ring + at * 2, data, first * 2 * sizeof(int16_t));
+   if (take > first)
+      memcpy(core_audio_ring, data + first * 2, (take - first) * 2 * sizeof(int16_t));
 
-      unsigned take  = (unsigned)((frames - pos < space) ? (frames - pos) : space);
-      unsigned first = CORE_AUDIO_RING_FRAMES - core_audio_ring_write;
-      if (first > take)
-         first = take;
+   write = (write + take) % CORE_AUDIO_RING_WRAP;
+   __atomic_store_n(&core_audio_ring_write, write, __ATOMIC_RELEASE);
 
-      memcpy(core_audio_ring + core_audio_ring_write * 2, data + pos * 2,
-            first * 2 * sizeof(int16_t));
-      if (take > first)
-         memcpy(core_audio_ring, data + (pos + first) * 2,
-               (take - first) * 2 * sizeof(int16_t));
-
-      core_audio_ring_write = (core_audio_ring_write + take) % CORE_AUDIO_RING_FRAMES;
-      core_audio_ring_count += take;
-      pos += take;
-
-      if (core_audio_ring_count >= AUDIO_PORT_GRAIN && core_audio_sema >= 0)
-         sceKernelSignalSema(core_audio_sema, 1);
-   }
+   if (core_audio_ring_fill(write, read) >= AUDIO_PORT_GRAIN && core_audio_sema >= 0)
+      sceKernelSignalSema(core_audio_sema, 1);
 
    return frames;
 }
@@ -1229,26 +1255,34 @@ static int core_audio_thread_func(SceSize args, void *argp)
    (void)args;
    (void)argp;
 
-   while (core_audio_thread_run)
+   while (__atomic_load_n(&core_audio_thread_run, __ATOMIC_ACQUIRE))
    {
       sceKernelWaitSema(core_audio_sema, 1, NULL);
-      if (!core_audio_thread_run)
+      if (!__atomic_load_n(&core_audio_thread_run, __ATOMIC_ACQUIRE))
          break;
 
-      while (core_audio_ring_count >= AUDIO_PORT_GRAIN && core_audio_thread_run)
+      while (__atomic_load_n(&core_audio_thread_run, __ATOMIC_ACQUIRE))
       {
-         unsigned first = CORE_AUDIO_RING_FRAMES - core_audio_ring_read;
+         unsigned read  = core_audio_ring_read;
+         unsigned write = __atomic_load_n(&core_audio_ring_write, __ATOMIC_ACQUIRE);
+         unsigned at    = read % CORE_AUDIO_RING_FRAMES;
+         unsigned first = CORE_AUDIO_RING_FRAMES - at;
+
+         if (core_audio_ring_fill(write, read) < AUDIO_PORT_GRAIN)
+            break;
+
          if (first > AUDIO_PORT_GRAIN)
             first = AUDIO_PORT_GRAIN;
 
-         memcpy(grain_buf, core_audio_ring + core_audio_ring_read * 2,
-               first * 2 * sizeof(int16_t));
+         memcpy(grain_buf, core_audio_ring + at * 2, first * 2 * sizeof(int16_t));
          if (first < AUDIO_PORT_GRAIN)
             memcpy(grain_buf + first * 2, core_audio_ring,
                   (AUDIO_PORT_GRAIN - first) * 2 * sizeof(int16_t));
 
-         core_audio_ring_read   = (core_audio_ring_read + AUDIO_PORT_GRAIN) % CORE_AUDIO_RING_FRAMES;
-         core_audio_ring_count -= AUDIO_PORT_GRAIN;
+         // only after the copy, so the game thread can't refill these
+         // samples while they're still being read
+         __atomic_store_n(&core_audio_ring_read, (read + AUDIO_PORT_GRAIN) % CORE_AUDIO_RING_WRAP,
+               __ATOMIC_RELEASE);
 
          if (audio_port >= 0)
             sceAudioOutOutput(audio_port, grain_buf);
@@ -1262,7 +1296,6 @@ static void core_audio_thread_start(void)
 {
    core_audio_ring_write = 0;
    core_audio_ring_read  = 0;
-   core_audio_ring_count = 0;
 
    core_audio_sema = sceKernelCreateSema("core_audio_sema", 0, 0, CORE_AUDIO_RING_GRAINS, NULL);
    core_audio_thread_run = true;
@@ -1284,7 +1317,7 @@ static void core_audio_thread_stop(void)
 {
    if (core_audio_thread_id >= 0)
    {
-      core_audio_thread_run = false;
+      __atomic_store_n(&core_audio_thread_run, false, __ATOMIC_RELEASE);
       sceKernelSignalSema(core_audio_sema, 1);
       sceKernelWaitThreadEnd(core_audio_thread_id, NULL, NULL);
       sceKernelDeleteThread(core_audio_thread_id);
@@ -1508,27 +1541,8 @@ static bool action_pressed(int action_id)
 // and started, this is what actually keeps this a true single-player
 // side switch. p2 has no diagnostic-menu access - anything not on
 // active_player_port is a hard no-op, port 0 included
-static int16_t input_state_cb(unsigned port, unsigned device, unsigned index, unsigned id)
+static int16_t local_button_state(unsigned id)
 {
-   (void)index;
-
-   // warm_up_core() burns throwaway frames right after load with
-   // whatever's still physically held from picking the game in our own
-   // menu (start, most likely). masking everything here keeps that from
-   // reaching the core at all, so it can't trip anything, diagnostic
-   // hold combo included, before real gameplay has even started
-   if (core_warming_up)
-      return 0;
-
-   if (device != RETRO_DEVICE_JOYPAD)
-      return 0;
-
-   // p2 never forwards anything to port 0 - a genuine p1 start/credit on
-   // an uncredited port is exactly what spawned p1 into p2's game. p2
-   // simply has no diagnostic-menu access
-   if (port != active_player_port)
-      return 0;
-
    switch (id)
    {
       case RETRO_DEVICE_ID_JOYPAD_UP:    return (pad.buttons & SCE_CTRL_UP)    ? 1 : 0;
@@ -1560,6 +1574,48 @@ static int16_t input_state_cb(unsigned port, unsigned device, unsigned index, un
    }
 
    return 0;
+}
+
+// the same buttons input_state_cb would report right now, packed one bit
+// per retropad id. this is what gets sent to the other vita every frame
+static uint16_t local_input_bits(void)
+{
+   uint16_t bits = 0;
+
+   for (unsigned id = 0; id < 16; id++)
+   {
+      if (local_button_state(id))
+         bits |= (uint16_t)(1u << id);
+   }
+
+   return bits;
+}
+
+static int16_t input_state_cb(unsigned port, unsigned device, unsigned index, unsigned id)
+{
+   (void)index;
+
+   // warm_up_core() burns throwaway frames right after load with
+   // whatever's still physically held from picking the game in our own
+   // menu (start, most likely). masking everything here keeps that from
+   // reaching the core at all, so it can't trip anything, diagnostic
+   // hold combo included, before real gameplay has even started
+   if (core_warming_up)
+      return 0;
+
+   if (device != RETRO_DEVICE_JOYPAD)
+      return 0;
+
+   if (netplay_active)
+      return (id < 16 && (netplay_input(port) & (1u << id))) ? 1 : 0;
+
+   // p2 never forwards anything to port 0 - a genuine p1 start/credit on
+   // an uncredited port is exactly what spawned p1 into p2's game. p2
+   // simply has no diagnostic-menu access
+   if (port != active_player_port)
+      return 0;
+
+   return local_button_state(id);
 }
 
 // compute scaled destination rect. w/h (source geometry) only matter for
@@ -1601,7 +1657,7 @@ static void compute_dest_rect(unsigned w, unsigned h, float *dx, float *dy, floa
 
 // crt filter / vignette baking
 //
-// all of these used to be drawn as a pile of individual vita2d_draw_rectangle
+// all of these used to be drawn as a pile of individual draw_rectangle
 // calls every single frame, up to 700+ of them for the heavier filters
 // (grid+, rgb mask), plus another 250-400 for the vignette pulse fx on top
 // of that. each rectangle is a separate draw submission, and that per-call
@@ -1711,15 +1767,15 @@ static void bake_vignette(uint32_t *px, unsigned stride_px, int w, int h,
 
 // allocates a w x h rgba8 texture, cleared to transparent, ready for a
 // bake_* helper to fill in before it's drawn
-static vita2d_texture *alloc_bake_tex(int w, int h, uint32_t **out_px, unsigned *out_stride_px)
+static gfx_texture *alloc_bake_tex(int w, int h, uint32_t **out_px, unsigned *out_stride_px)
 {
-   vita2d_texture *tex = vita2d_create_empty_texture_format(w, h, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR);
+   gfx_texture *tex = gfx_create_texture(w, h, GL_RGBA, GL_UNSIGNED_BYTE);
 
    if (!tex)
       return NULL;
 
-   *out_px        = (uint32_t *)vita2d_texture_get_datap(tex);
-   *out_stride_px = vita2d_texture_get_stride(tex) / 4;
+   *out_px        = (uint32_t *)gfx_texture_get_datap(tex);
+   *out_stride_px = gfx_texture_get_stride(tex) / 4;
    memset(*out_px, 0, (size_t)(*out_stride_px) * (unsigned)h * 4);
 
    return tex;
@@ -1727,11 +1783,11 @@ static vita2d_texture *alloc_bake_tex(int w, int h, uint32_t **out_px, unsigned 
 
 // rasterizes one display_filter pattern at w x h. 'field' only matters for
 // interlace: 0 darkens rows 0-1/4-5/..., 1 darkens rows 2-3/6-7/...
-static vita2d_texture *bake_display_filter(int mode, int w, int h, int field)
+static gfx_texture *bake_display_filter(int mode, int w, int h, int field)
 {
    uint32_t *px;
    unsigned stride_px;
-   vita2d_texture *tex = alloc_bake_tex(w, h, &px, &stride_px);
+   gfx_texture *tex = alloc_bake_tex(w, h, &px, &stride_px);
 
    if (!tex)
       return NULL;
@@ -1811,8 +1867,8 @@ static vita2d_texture *bake_display_filter(int mode, int w, int h, int field)
 // mode/size they were baked for. a rebuild only fires when either one
 // actually changes, a settings cycle in the pause menu or a new game
 // with different viewport geometry, never once a frame
-static vita2d_texture *filter_tex        = NULL;
-static vita2d_texture *filter_tex_field2 = NULL; // interlace's second field
+static gfx_texture *filter_tex        = NULL;
+static gfx_texture *filter_tex_field2 = NULL; // interlace's second field
 static int filter_tex_mode = -1;
 static int filter_tex_w    = -1;
 static int filter_tex_h    = -1;
@@ -1825,17 +1881,17 @@ static void free_filter_tex(void)
    // without waiting here was the actual crash: cycling off interlace into
    // another filter could yank it out from under an in-flight draw
    if (filter_tex || filter_tex_field2)
-      vita2d_wait_rendering_done();
+      gfx_wait_rendering_done();
 
    if (filter_tex)
    {
-      vita2d_free_texture(filter_tex);
+      gfx_free_texture(filter_tex);
       filter_tex = NULL;
    }
 
    if (filter_tex_field2)
    {
-      vita2d_free_texture(filter_tex_field2);
+      gfx_free_texture(filter_tex_field2);
       filter_tex_field2 = NULL;
    }
 
@@ -1874,7 +1930,7 @@ static void draw_display_filter(float dx, float dy, float dw, float dh)
       filter_tex_h    = h;
    }
 
-   vita2d_texture *tex = filter_tex;
+   gfx_texture *tex = filter_tex;
 
    if (display_filter == DISPLAY_FILTER_INTERLACE && filter_tex_field2)
    {
@@ -1885,7 +1941,7 @@ static void draw_display_filter(float dx, float dy, float dw, float dh)
    }
 
    if (tex)
-      vita2d_draw_texture(tex, dx, dy);
+      gfx_draw_texture(tex, dx, dy);
 }
 
 // baked once at load_menu_assets time, peak 255 on both axes (see the
@@ -1955,8 +2011,8 @@ static void draw_wallpaper_overlay(void)
    if (!overlay_tex)
       return;
 
-   float ow = (float)vita2d_texture_get_width(overlay_tex);
-   float oh = (float)vita2d_texture_get_height(overlay_tex);
+   float ow = (float)gfx_texture_get_width(overlay_tex);
+   float oh = (float)gfx_texture_get_height(overlay_tex);
    float base_sx = SCREEN_W / ow;
    float base_sy = SCREEN_H / oh;
 
@@ -2013,12 +2069,9 @@ static void draw_wallpaper_overlay(void)
    }
 
    // skip the tint draw path entirely when it'd be a no-op (full opacity,
-   // no color/alpha animation active this frame). tinted and untinted
-   // draws don't share the same gpu state in vita2d, so bouncing between
-   // them every frame was its own quiet source of redundant state changes,
-   // on top of all the rect spam above
+   // no color/alpha animation active this frame)
    if (r == 1.0f && g == 1.0f && b == 1.0f && alpha >= 254.5f)
-      vita2d_draw_texture_scale(overlay_tex, x, y, base_sx * scale, base_sy * scale);
+      gfx_draw_texture_scale(overlay_tex, x, y, base_sx * scale, base_sy * scale);
    else
    {
       unsigned tint = RGBA8(
@@ -2027,7 +2080,7 @@ static void draw_wallpaper_overlay(void)
             (unsigned)(b * 255.0f + 0.5f),
             (unsigned)(alpha + 0.5f));
 
-      vita2d_draw_texture_tint_scale(overlay_tex, x, y, base_sx * scale, base_sy * scale, tint);
+      gfx_draw_texture_tint_scale(overlay_tex, x, y, base_sx * scale, base_sy * scale, tint);
    }
 
    if (wallpaper_fx == WALLPAPER_FX_VIGNETTE && vignette_pulse_tex)
@@ -2040,7 +2093,7 @@ static void draw_wallpaper_overlay(void)
       float pulse = 0.5f + 0.5f * sinf(secs * (2.0f * (float)M_PI / 10.0f));
       int peak = (int)(50.0f + 110.0f * pulse);
 
-      vita2d_draw_texture_tint(vignette_pulse_tex, 0.0f, 0.0f, RGBA8(255, 255, 255, (unsigned)peak));
+      gfx_draw_texture_tint(vignette_pulse_tex, 0.0f, 0.0f, RGBA8(255, 255, 255, (unsigned)peak));
    }
 }
 
@@ -2053,14 +2106,16 @@ static void draw_gameplay_layer(float dx, float dy, float dw, float dh)
    if ((aspect_mode == ASPECT_4_3 || aspect_mode == ASPECT_5_4) && overlay_tex != NULL)
       draw_wallpaper_overlay();
 
-   vita2d_draw_texture_scale(frame_tex, dx, dy, dw / (float)fb_w, dh / (float)fb_h);
+   gfx_draw_texture_scale(frame_tex, dx, dy, dw / (float)fb_w, dh / (float)fb_h);
    draw_display_filter(dx, dy, dw, dh);
 }
 
-static void blit_frame(void)
+// copies the core's latest frame into frame_tex, false if there's
+// nothing usable to show yet
+static bool upload_frame(void)
 {
    if (!fb_data || !fb_w || !fb_h)
-      return;
+      return false;
 
    if (!frame_tex || tex_w != fb_w || tex_h != fb_h)
    {
@@ -2071,42 +2126,56 @@ static void blit_frame(void)
          // this path fires on every new game load (main() zeroes tex_w/h to
          // force it), so skipping the wait here is exactly what could leave
          // the loading screen up forever on a fast quit-then-load
-         vita2d_wait_rendering_done();
-         vita2d_free_texture(frame_tex);
+         gfx_wait_rendering_done();
+         gfx_free_texture(frame_tex);
          frame_tex = NULL;
       }
 
-      frame_tex = vita2d_create_empty_texture_format(fb_w, fb_h, SCE_GXM_TEXTURE_FORMAT_R5G6B5);
+      frame_tex = gfx_create_texture(fb_w, fb_h, GL_RGB, GL_UNSIGNED_SHORT_5_6_5);
       if (!frame_tex)
       {
          // out of gpu memory or similar: bail and retry next frame instead
-         // of handing vita2d_texture_get_datap() below a null texture
+         // of handing gfx_texture_get_datap() below a null texture
          tex_w = 0;
          tex_h = 0;
-         return;
+         return false;
       }
 
       tex_w = fb_w;
       tex_h = fb_h;
    }
 
-   uint8_t *dst = (uint8_t *)vita2d_texture_get_datap(frame_tex);
-   unsigned dst_stride = vita2d_texture_get_stride(frame_tex);
+   uint8_t *dst = (uint8_t *)gfx_texture_get_datap(frame_tex);
+   unsigned dst_stride = gfx_texture_get_stride(frame_tex);
    const uint8_t *src = (const uint8_t *)fb_data;
 
    for (unsigned y = 0; y < fb_h; y++)
       memcpy(dst + y * dst_stride, src + y * fb_pitch, fb_w * 2);
 
+   return true;
+}
+
+// overlay gets painted on top of the game, online play uses it for its
+// waiting/leave banners
+static void present_frame(void (*overlay)(void))
+{
    float dx, dy, dw, dh;
    compute_dest_rect(fb_w, fb_h, &dx, &dy, &dw, &dh);
 
-   vita2d_start_drawing();
-   vita2d_clear_screen();
+   gfx_begin_frame();
 
    draw_gameplay_layer(dx, dy, dw, dh);
 
-   vita2d_end_drawing();
-   vita2d_swap_buffers();
+   if (overlay)
+      overlay();
+
+   gfx_end_frame();
+}
+
+static void blit_frame(void)
+{
+   if (upload_frame())
+      present_frame(NULL);
 }
 
 // pause menu panel layout, 1:1 with the html/canvas mockup, centered on
@@ -2192,17 +2261,17 @@ static void draw_text_outline_l(int x, int y, unsigned int size, const char *s)
    };
 
    for (int i = 0; i < 4; i++)
-      vita2d_font_draw_text(font, x + off[i][0], y + off[i][1], RGBA8(0, 0, 0, 255), size, s);
+      gfx_font_draw_text(font, x + off[i][0], y + off[i][1], RGBA8(0, 0, 0, 255), size, s);
 
-   vita2d_font_draw_text(font, x, y, RGBA8(231, 231, 231, 255), size, s);
+   gfx_font_draw_text(font, x, y, RGBA8(231, 231, 231, 255), size, s);
 }
 
 // crop rect (cover fit) so a photo texture fills dst_w x dst_h with no letterboxing
-static void cover_src_rect(vita2d_texture *tex, float dst_w, float dst_h,
+static void cover_src_rect(gfx_texture *tex, float dst_w, float dst_h,
       float *sx, float *sy, float *sw, float *sh)
 {
-   float tw = (float)vita2d_texture_get_width(tex);
-   float th = (float)vita2d_texture_get_height(tex);
+   float tw = (float)gfx_texture_get_width(tex);
+   float th = (float)gfx_texture_get_height(tex);
    float scale_x = dst_w / tw;
    float scale_y = dst_h / th;
    float scale = (scale_x > scale_y) ? scale_x : scale_y;
@@ -2222,12 +2291,12 @@ static void draw_panel_box(int x, int y, int w, int h)
    {
       float sx, sy, sw, sh;
       cover_src_rect(pause_photo_tex, (float)w, (float)h, &sx, &sy, &sw, &sh);
-      vita2d_draw_texture_part_scale(pause_photo_tex, (float)x, (float)y,
+      gfx_draw_texture_part_scale(pause_photo_tex, (float)x, (float)y,
             sx, sy, sw, sh, (float)w / sw, (float)h / sh);
    }
    else
    {
-      vita2d_draw_rectangle(x, y, w, h, PANEL_BG_COLOR);
+      gfx_draw_rectangle(x, y, w, h, PANEL_BG_COLOR);
    }
 
    // frame art is baked at the old 500x260-ish panel size, so stretch it
@@ -2236,12 +2305,12 @@ static void draw_panel_box(int x, int y, int w, int h)
    // frame asset at the new size
    if (pause_frame_tex)
    {
-      float fw = (float)vita2d_texture_get_width(pause_frame_tex);
-      float fh = (float)vita2d_texture_get_height(pause_frame_tex);
+      float fw = (float)gfx_texture_get_width(pause_frame_tex);
+      float fh = (float)gfx_texture_get_height(pause_frame_tex);
       float sx = (fw > 0.0f) ? (float)(w + PANEL_BORDER * 2) / fw : 1.0f;
       float sy = (fh > 0.0f) ? (float)(h + PANEL_BORDER * 2) / fh : 1.0f;
 
-      vita2d_draw_texture_scale(pause_frame_tex, (float)(x - PANEL_BORDER),
+      gfx_draw_texture_scale(pause_frame_tex, (float)(x - PANEL_BORDER),
             (float)(y - PANEL_BORDER), sx, sy);
    }
 }
@@ -2257,9 +2326,9 @@ static void draw_menu_backdrop(void)
 
    float sx, sy, sw, sh;
    cover_src_rect(menu_backdrop_tex, (float)SCREEN_W, (float)SCREEN_H, &sx, &sy, &sw, &sh);
-   vita2d_draw_texture_part_scale(menu_backdrop_tex, 0.0f, 0.0f,
+   gfx_draw_texture_part_scale(menu_backdrop_tex, 0.0f, 0.0f,
          sx, sy, sw, sh, (float)SCREEN_W / sw, (float)SCREEN_H / sh);
-   vita2d_draw_rectangle(0, 0, SCREEN_W, SCREEN_H, RGBA8(3, 8, 18, 89));
+   gfx_draw_rectangle(0, 0, SCREEN_W, SCREEN_H, RGBA8(3, 8, 18, 89));
 }
 
 // draws the panel: live photo (cover fit) + baked border/overlay frame on top
@@ -2271,7 +2340,7 @@ static void draw_pause_panel(void)
 static void draw_pause_ribbon(void)
 {
    if (pause_ribbon_tex)
-      vita2d_draw_texture(pause_ribbon_tex, (float)(PAUSE_HEADER_X - HEADER_PAD), (float)(PAUSE_HEADER_Y - HEADER_PAD));
+      gfx_draw_texture(pause_ribbon_tex, (float)(PAUSE_HEADER_X - HEADER_PAD), (float)(PAUSE_HEADER_Y - HEADER_PAD));
 }
 
 // which two adjacent cells of the shine sheet we're between right now, and
@@ -2311,18 +2380,18 @@ static void draw_pause_hilite_at(int x, int item_y, int w)
 
    if (!pause_hilite_tex)
    {
-      vita2d_draw_rectangle(x, y, w, ITEM_H, RGBA8(220, 130, 40, 200));
+      gfx_draw_rectangle(x, y, w, ITEM_H, RGBA8(220, 130, 40, 200));
       return;
    }
 
    hilite_frame_blend(&col_a, &row_a, &col_b, &row_b, &blend);
 
-   vita2d_draw_texture_tint_part_scale(pause_hilite_tex, (float)x, (float)y,
+   gfx_draw_texture_tint_part_scale(pause_hilite_tex, (float)x, (float)y,
          (float)(col_a * HILITE_CELL_W), (float)(row_a * HILITE_CELL_H),
          (float)HILITE_CELL_W, (float)HILITE_CELL_H, xs, ys,
          RGBA8(255, 255, 255, 255));
 
-   vita2d_draw_texture_tint_part_scale(pause_hilite_tex, (float)x, (float)y,
+   gfx_draw_texture_tint_part_scale(pause_hilite_tex, (float)x, (float)y,
          (float)(col_b * HILITE_CELL_W), (float)(row_b * HILITE_CELL_H),
          (float)HILITE_CELL_W, (float)HILITE_CELL_H, xs, ys,
          RGBA8(255, 255, 255, (unsigned)(blend * 255.0f)));
@@ -2339,7 +2408,7 @@ static void draw_item_label_at(int x, int item_y, int w, const char *s)
 {
    unsigned size = ITEM_FONT_SIZE;
    int max_w = w - ITEM_TEXT_PAD * 2;
-   int tw = vita2d_font_text_width(font, size, s);
+   int tw = gfx_font_text_width(font, size, s);
 
    if (tw > max_w && tw > 0)
    {
@@ -2397,16 +2466,16 @@ static void draw_prompt_box(int x, int y, int w, int h)
 {
    if (prompt_bg_tex)
    {
-      float tw = (float)vita2d_texture_get_width(prompt_bg_tex);
-      float th = (float)vita2d_texture_get_height(prompt_bg_tex);
+      float tw = (float)gfx_texture_get_width(prompt_bg_tex);
+      float th = (float)gfx_texture_get_height(prompt_bg_tex);
       float sx = (tw > 0.0f) ? (float)w / tw : 1.0f;
       float sy = (th > 0.0f) ? (float)h / th : 1.0f;
 
-      vita2d_draw_texture_scale(prompt_bg_tex, (float)x, (float)y, sx, sy);
+      gfx_draw_texture_scale(prompt_bg_tex, (float)x, (float)y, sx, sy);
    }
    else
    {
-      vita2d_draw_rectangle(x, y, w, h, PANEL_BG_COLOR);
+      gfx_draw_rectangle(x, y, w, h, PANEL_BG_COLOR);
    }
 }
 
@@ -2476,8 +2545,7 @@ static bool show_prompt(const char *message, int type, void (*draw_backdrop)(voi
          }
       }
 
-      vita2d_start_drawing();
-      vita2d_clear_screen();
+      gfx_begin_frame();
 
       if (draw_backdrop)
          draw_backdrop();
@@ -2485,13 +2553,13 @@ static bool show_prompt(const char *message, int type, void (*draw_backdrop)(voi
       // slight dim over whatever's behind, on top of that screen's own
       // dim/tint if it has one -- the dialog needs to read as clearly
       // frontmost no matter which menu opened it
-      vita2d_draw_rectangle(0, 0, SCREEN_W, SCREEN_H, RGBA8(0, 0, 0, 140));
+      gfx_draw_rectangle(0, 0, SCREEN_W, SCREEN_H, RGBA8(0, 0, 0, 140));
 
       draw_prompt_box(PROMPT_PANEL_X, PROMPT_PANEL_Y, PROMPT_PANEL_W, PROMPT_PANEL_H);
 
       for (int i = 0; i < line_count; i++)
       {
-         int lw = vita2d_font_text_width(font, PROMPT_MSG_FONT_SIZE, lines[i]);
+         int lw = gfx_font_text_width(font, PROMPT_MSG_FONT_SIZE, lines[i]);
          draw_text_outline_l(cx - lw / 2, msg_y + i * PROMPT_MSG_LINE_H, PROMPT_MSG_FONT_SIZE, lines[i]);
       }
 
@@ -2500,8 +2568,8 @@ static bool show_prompt(const char *message, int type, void (*draw_backdrop)(voi
          int total_w = PROMPT_BTN_W * 2 + PROMPT_BTN_GAP;
          int yes_x   = cx - total_w / 2;
          int no_x    = yes_x + PROMPT_BTN_W + PROMPT_BTN_GAP;
-         int yw      = vita2d_font_text_width(font, ITEM_FONT_SIZE, "Yes");
-         int nw      = vita2d_font_text_width(font, ITEM_FONT_SIZE, "No");
+         int yw      = gfx_font_text_width(font, ITEM_FONT_SIZE, "Yes");
+         int nw      = gfx_font_text_width(font, ITEM_FONT_SIZE, "No");
 
          draw_pause_hilite_at(sel == 0 ? yes_x : no_x, btn_y, PROMPT_BTN_W);
 
@@ -2513,15 +2581,14 @@ static bool show_prompt(const char *message, int type, void (*draw_backdrop)(voi
       else
       {
          int ok_x = cx - PROMPT_BTN_W / 2;
-         int ow   = vita2d_font_text_width(font, ITEM_FONT_SIZE, "OK");
+         int ow   = gfx_font_text_width(font, ITEM_FONT_SIZE, "OK");
 
          draw_pause_hilite_at(ok_x, btn_y, PROMPT_BTN_W);
          draw_text_outline_l(ok_x + (PROMPT_BTN_W - ow) / 2,
                btn_y + (int)(ITEM_FONT_SIZE * 0.35f), ITEM_FONT_SIZE, "OK");
       }
 
-      vita2d_end_drawing();
-      vita2d_swap_buffers();
+      gfx_end_frame();
    }
 }
 
@@ -2733,8 +2800,8 @@ static void reload_overlay_texture(void)
 {
    if (overlay_tex)
    {
-      vita2d_wait_rendering_done();
-      vita2d_free_texture(overlay_tex);
+      gfx_wait_rendering_done();
+      gfx_free_texture(overlay_tex);
       overlay_tex = NULL;
    }
 
@@ -2743,7 +2810,7 @@ static void reload_overlay_texture(void)
       char overlay_path[64];
       snprintf(overlay_path, sizeof(overlay_path),
             "ux0:data/NaohAC/overlays/%d.png", current_overlay);
-      overlay_tex = vita2d_load_PNG_file(overlay_path);
+      overlay_tex = gfx_load_png(overlay_path);
    }
 }
 
@@ -3007,7 +3074,7 @@ static void draw_paused_gameplay_dimmed(void)
    }
 
    // dim the paused game frame behind the panel
-   vita2d_draw_rectangle(0, 0, SCREEN_W, SCREEN_H, RGBA8(0, 0, 0, 180));
+   gfx_draw_rectangle(0, 0, SCREEN_W, SCREEN_H, RGBA8(0, 0, 0, 180));
 }
 
 // the pause menu's main-screen row list (panel + ribbon are drawn
@@ -3166,11 +3233,11 @@ static bool pause_menu(void)
                display_filter = (display_filter + 1) % DISPLAY_FILTER_COUNT;
 
                // free the stale bake right here, before this loop's own
-               // vita2d_start_drawing() below opens a scene -- draw_display_filter
+               // gfx_begin_frame() below starts a new frame -- draw_display_filter
                // would otherwise catch the mode mismatch itself on the very next
-               // draw and free it from inside that scene instead, and
-               // free_filter_tex's wait_rendering_done() call is not valid mid-scene
-               // (see free_filter_tex). this is the exact same rule
+               // draw and free it from inside that frame instead, and the glFinish
+               // behind free_filter_tex's wait_rendering_done() would flush the
+               // half-drawn scene early (see free_filter_tex). this is the exact same rule
                // reload_overlay_texture already follows for the wallpaper toggle
                // just above
                free_filter_tex();
@@ -3198,8 +3265,7 @@ static bool pause_menu(void)
          }
       }
 
-      vita2d_start_drawing();
-      vita2d_clear_screen();
+      gfx_begin_frame();
 
       draw_paused_gameplay_dimmed();
 
@@ -3262,8 +3328,7 @@ static bool pause_menu(void)
          }
       }
 
-      vita2d_end_drawing();
-      vita2d_swap_buffers();
+      gfx_end_frame();
    }
 }
 
@@ -3305,12 +3370,12 @@ static void draw_hilite_stretched(int x, int y, int w, int h)
 
    hilite_frame_blend(&col_a, &row_a, &col_b, &row_b, &blend);
 
-   vita2d_draw_texture_tint_part_scale(pause_hilite_tex, (float)x, (float)y,
+   gfx_draw_texture_tint_part_scale(pause_hilite_tex, (float)x, (float)y,
          (float)(col_a * HILITE_CELL_W), (float)(row_a * HILITE_CELL_H),
          (float)HILITE_CELL_W, (float)HILITE_CELL_H, xs, ys,
          RGBA8(255, 255, 255, 255));
 
-   vita2d_draw_texture_tint_part_scale(pause_hilite_tex, (float)x, (float)y,
+   gfx_draw_texture_tint_part_scale(pause_hilite_tex, (float)x, (float)y,
          (float)(col_b * HILITE_CELL_W), (float)(row_b * HILITE_CELL_H),
          (float)HILITE_CELL_W, (float)HILITE_CELL_H, xs, ys,
          RGBA8(255, 255, 255, (unsigned)(blend * 255.0f)));
@@ -3322,12 +3387,12 @@ static void draw_menu_header(void)
    {
       float hdr_x = (float)(GHDR_X - GHDR_PAD);
       float hdr_y = (float)(GHDR_Y - GHDR_PAD);
-      float hdr_w = (float)vita2d_texture_get_width(menu_header_tex);
+      float hdr_w = (float)gfx_texture_get_width(menu_header_tex);
 
-      vita2d_draw_texture(menu_header_tex, hdr_x, hdr_y);
+      gfx_draw_texture(menu_header_tex, hdr_x, hdr_y);
 
       // thin gold trim strip, floating just above the red header bar
-      vita2d_draw_rectangle(hdr_x, hdr_y - (float)(GHDR_TRIM_GAP + GHDR_TRIM_H), hdr_w, (float)GHDR_TRIM_H,
+      gfx_draw_rectangle(hdr_x, hdr_y - (float)(GHDR_TRIM_GAP + GHDR_TRIM_H), hdr_w, (float)GHDR_TRIM_H,
             RGBA8(212, 175, 55, 255));
    }
 }
@@ -3382,21 +3447,21 @@ static const unsigned SLOT_DIM_TINT = RGBA8(153, 153, 153, 255);
 // pop out of
 static void draw_game_slot(unsigned i, float x, float y, float w, float h, bool is_lit)
 {
-   vita2d_texture *tex = cover_tex[games[i].known_idx];
+   gfx_texture *tex = cover_tex[games[i].known_idx];
    if (tex)
    {
-      float tw = (float)vita2d_texture_get_width(tex);
-      float th = (float)vita2d_texture_get_height(tex);
+      float tw = (float)gfx_texture_get_width(tex);
+      float th = (float)gfx_texture_get_height(tex);
 
       if (is_lit)
-         vita2d_draw_texture_scale(tex, x, y, w / tw, h / th);
+         gfx_draw_texture_scale(tex, x, y, w / tw, h / th);
       else
-         vita2d_draw_texture_tint_scale(tex, x, y, w / tw, h / th, SLOT_DIM_TINT);
+         gfx_draw_texture_tint_scale(tex, x, y, w / tw, h / th, SLOT_DIM_TINT);
    }
    else
    {
-      vita2d_draw_rectangle(x, y, w, h, RGBA8(60, 60, 60, 255));
-      vita2d_font_draw_text(font, (int)(x + 8), (int)(y + h / 2.0f),
+      gfx_draw_rectangle(x, y, w, h, RGBA8(60, 60, 60, 255));
+      gfx_font_draw_text(font, (int)(x + 8), (int)(y + h / 2.0f),
             RGBA8(220, 220, 220, 255), (unsigned int)(FONT_BASE_PX * 0.7f),
             known_games[games[i].known_idx].base_id);
    }
@@ -3426,7 +3491,7 @@ static void draw_carousel_spotlight(void)
    float sy = y + h * 0.5f - sh * 0.5f;
    float tex_size = (float)SPOTLIGHT_TEX_SIZE;
 
-   vita2d_draw_texture_tint_scale(spotlight_tex, sx, sy,
+   gfx_draw_texture_tint_scale(spotlight_tex, sx, sy,
          sw / tex_size, sh / tex_size, RGBA8(255, 255, 255, 130));
 }
 
@@ -3441,15 +3506,15 @@ static void draw_info_row(int row, const char *label, const char *value, bool se
 
    draw_text_outline_l(INFO_X + 24, mid, 16, label);
 
-   int vw = vita2d_font_text_width(font, 16, value);
+   int vw = gfx_font_text_width(font, 16, value);
    int vx = INFO_X + INFO_W / 2 - vw / 2;
 
    if (sel)
    {
       // small arrows hint the value is toggleable with left/right
-      vita2d_font_draw_text(font, vx - 24, mid, RGBA8(58, 42, 16, 255), 16, "<");
-      vita2d_font_draw_text(font, vx + vw + 10, mid, RGBA8(58, 42, 16, 255), 16, ">");
-      vita2d_font_draw_text(font, vx, mid, RGBA8(26, 26, 26, 255), 16, value);
+      gfx_font_draw_text(font, vx - 24, mid, RGBA8(58, 42, 16, 255), 16, "<");
+      gfx_font_draw_text(font, vx + vw + 10, mid, RGBA8(58, 42, 16, 255), 16, ">");
+      gfx_font_draw_text(font, vx, mid, RGBA8(26, 26, 26, 255), 16, value);
    }
    else
    {
@@ -3463,25 +3528,48 @@ static void draw_info_panel(int sel, menu_focus_t focus)
    {
       float sx, sy, sw, sh;
       cover_src_rect(pause_photo_tex, (float)INFO_W, (float)INFO_H, &sx, &sy, &sw, &sh);
-      vita2d_draw_texture_part_scale(pause_photo_tex, (float)INFO_X, (float)INFO_Y,
+      gfx_draw_texture_part_scale(pause_photo_tex, (float)INFO_X, (float)INFO_Y,
             sx, sy, sw, sh, (float)INFO_W / sw, (float)INFO_H / sh);
    }
    if (info_frame_tex)
-      vita2d_draw_texture(info_frame_tex, (float)(INFO_X - INFO_BORDER), (float)(INFO_Y - INFO_BORDER));
+      gfx_draw_texture(info_frame_tex, (float)(INFO_X - INFO_BORDER), (float)(INFO_Y - INFO_BORDER));
 
    draw_info_row(0, "Game", games[sel].label, focus == MENU_FOCUS_GAMES);
-   draw_info_row(1, "Game Version", region_labels[game_region[sel]], focus == MENU_FOCUS_VERSION);
-   draw_info_row(2, "Player", player_port_labels[game_player_port[sel]], focus == MENU_FOCUS_PLAYER);
+
+   // online there's no version to pick up front: the room list shows
+   // every version's rooms and hosting asks which one, if there's a choice
+   if (carousel_online)
+   {
+      char owned[48] = "";
+      unsigned mask = online_owned[games[sel].known_idx];
+
+      for (int r = 0; r < REGION_COUNT; r++)
+      {
+         if (!(mask & (1u << r)))
+            continue;
+         if (owned[0])
+            strncat(owned, ", ", sizeof(owned) - strlen(owned) - 1);
+         strncat(owned, region_short[r], sizeof(owned) - strlen(owned) - 1);
+      }
+
+      draw_info_row(1, "Your ROMs", owned[0] ? owned : "None found", false);
+      draw_info_row(2, "Player", "Host plays P1, guest plays P2", false);
+   }
+   else
+   {
+      draw_info_row(1, "Game Version", region_labels[game_region[sel]], focus == MENU_FOCUS_VERSION);
+      draw_info_row(2, "Player", player_port_labels[game_player_port[sel]], focus == MENU_FOCUS_PLAYER);
+   }
 }
 
-static void draw_ps_prompt(vita2d_texture *tex, int x, int cy, const char *label)
+static void draw_ps_prompt(gfx_texture *tex, int x, int cy, const char *label)
 {
    if (tex)
    {
-      float s = (float)ICON_SIZE / (float)vita2d_texture_get_width(tex);
-      vita2d_draw_texture_scale(tex, (float)x, (float)(cy - ICON_SIZE / 2), s, s);
+      float s = (float)ICON_SIZE / (float)gfx_texture_get_width(tex);
+      gfx_draw_texture_scale(tex, (float)x, (float)(cy - ICON_SIZE / 2), s, s);
    }
-   vita2d_font_draw_text(font, x + ICON_SIZE + 8, cy + (int)(MARQUEE_FONT_SIZE * 0.35f),
+   gfx_font_draw_text(font, x + ICON_SIZE + 8, cy + (int)(MARQUEE_FONT_SIZE * 0.35f),
          RGBA8(220, 220, 220, 255), MARQUEE_FONT_SIZE, label);
 }
 
@@ -3501,22 +3589,22 @@ static void draw_pause_bottom_bar(int sel)
    {
       float sx, sy, sw, sh;
       cover_src_rect(pause_photo_tex, (float)SCREEN_W, (float)BAR_H, &sx, &sy, &sw, &sh);
-      vita2d_draw_texture_part_scale(pause_photo_tex, 0.0f, (float)BAR_Y,
+      gfx_draw_texture_part_scale(pause_photo_tex, 0.0f, (float)BAR_Y,
             sx, sy, sw, sh, (float)SCREEN_W / sw, (float)BAR_H / sh);
    }
    else
    {
-      vita2d_draw_rectangle(0, BAR_Y, SCREEN_W, BAR_H, RGBA8(10, 26, 52, 255));
+      gfx_draw_rectangle(0, BAR_Y, SCREEN_W, BAR_H, RGBA8(10, 26, 52, 255));
    }
 
    int cy = BAR_Y + BAR_H / 2;
 
    if (pause_items[sel].description)
-      vita2d_font_draw_text(font, PAUSE_BAR_SIDE_PAD, cy + (int)(MARQUEE_FONT_SIZE * 0.35f),
+      gfx_font_draw_text(font, PAUSE_BAR_SIDE_PAD, cy + (int)(MARQUEE_FONT_SIZE * 0.35f),
             RGBA8(170, 184, 210, 255), MARQUEE_FONT_SIZE, pause_items[sel].description);
 
-   int confirm_label_w = vita2d_font_text_width(font, MARQUEE_FONT_SIZE, "Confirm");
-   int back_label_w    = vita2d_font_text_width(font, MARQUEE_FONT_SIZE, "Back");
+   int confirm_label_w = gfx_font_text_width(font, MARQUEE_FONT_SIZE, "Confirm");
+   int back_label_w    = gfx_font_text_width(font, MARQUEE_FONT_SIZE, "Back");
    int confirm_w = ICON_SIZE + 8 + confirm_label_w;
    int back_w    = ICON_SIZE + 8 + back_label_w;
 
@@ -3528,7 +3616,7 @@ static void draw_pause_bottom_bar(int sel)
 }
 
 // one marquee item: icon + label, or a plain text-only entry (icon == NULL)
-typedef struct { vita2d_texture **icon; const char *label; } marquee_item_t;
+typedef struct { gfx_texture **icon; const char *label; } marquee_item_t;
 
 static const marquee_item_t marquee_items[] = {
    { &btn_tri_tex,   "Game Settings" },
@@ -3541,7 +3629,7 @@ static const marquee_item_t marquee_items[] = {
 
 static float marquee_item_width(const marquee_item_t *it)
 {
-   int lw = vita2d_font_text_width(font, MARQUEE_FONT_SIZE, it->label);
+   int lw = gfx_font_text_width(font, MARQUEE_FONT_SIZE, it->label);
    float pre = it->icon ? (float)ICON_SIZE + 8.0f : 0.0f;
    return pre + (float)lw;
 }
@@ -3564,7 +3652,7 @@ static float marquee_draw_strip(float x, int cy)
       if (it->icon)
          draw_ps_prompt(*it->icon, (int)x, cy, it->label);
       else
-         vita2d_font_draw_text(font, (int)x, cy + (int)(MARQUEE_FONT_SIZE * 0.35f),
+         gfx_font_draw_text(font, (int)x, cy + (int)(MARQUEE_FONT_SIZE * 0.35f),
                RGBA8(170, 184, 210, 255), MARQUEE_FONT_SIZE, it->label);
 
       x += marquee_item_width(it) + MARQUEE_GAP;
@@ -3578,12 +3666,12 @@ static void draw_bottom_bar(void)
    {
       float sx, sy, sw, sh;
       cover_src_rect(pause_photo_tex, (float)SCREEN_W, (float)BAR_H, &sx, &sy, &sw, &sh);
-      vita2d_draw_texture_part_scale(pause_photo_tex, 0.0f, (float)BAR_Y,
+      gfx_draw_texture_part_scale(pause_photo_tex, 0.0f, (float)BAR_Y,
             sx, sy, sw, sh, (float)SCREEN_W / sw, (float)BAR_H / sh);
    }
    else
    {
-      vita2d_draw_rectangle(0, BAR_Y, SCREEN_W, BAR_H, RGBA8(10, 26, 52, 255));
+      gfx_draw_rectangle(0, BAR_Y, SCREEN_W, BAR_H, RGBA8(10, 26, 52, 255));
    }
    int cy = BAR_Y + BAR_H / 2;
 
@@ -3612,7 +3700,7 @@ static void draw_main_menu_scene(int info_sel, int base_sel, float shift, menu_f
 
    if (game_count == 0)
    {
-      vita2d_font_draw_text(font, 80, 300, RGBA8(200, 80, 80, 255), FONT_BASE_PX,
+      gfx_font_draw_text(font, 80, 300, RGBA8(200, 80, 80, 255), FONT_BASE_PX,
             "NO ROMS FOUND IN " ROM_DIR);
       return;
    }
@@ -3710,7 +3798,7 @@ static void draw_main_menu_scene(int info_sel, int base_sel, float shift, menu_f
 
 typedef struct {
    const char *label;      // fallback text for l1/r1, which have no button glyph
-   vita2d_texture **icon;  // NULL for l1/r1
+   gfx_texture **icon;  // NULL for l1/r1
    int *map;               // points at one of the map_* globals above
 } ctrlcfg_row_t;
 
@@ -3735,8 +3823,8 @@ static void draw_ctrlcfg_row(int row_y, const ctrlcfg_row_t *row, bool sel, core
 
    if (row->icon && *row->icon)
    {
-      float s = (float)CTRLCFG_ICON_SIZE / (float)vita2d_texture_get_width(*row->icon);
-      vita2d_draw_texture_scale(*row->icon, (float)(CTRLCFG_ITEM_X + ITEM_TEXT_PAD),
+      float s = (float)CTRLCFG_ICON_SIZE / (float)gfx_texture_get_width(*row->icon);
+      gfx_draw_texture_scale(*row->icon, (float)(CTRLCFG_ITEM_X + ITEM_TEXT_PAD),
             (float)(row_y - CTRLCFG_ICON_SIZE / 2), s, s);
    }
    else
@@ -3771,7 +3859,7 @@ static void draw_ctrlcfg_reset_row(int row_y, bool sel)
 static void draw_ctrlcfg_banner(void)
 {
    if (settings_banner_tex)
-      vita2d_draw_texture(settings_banner_tex,
+      gfx_draw_texture(settings_banner_tex,
             (float)(CTRLCFG_HEADER_X - HEADER_PAD), (float)(CTRLCFG_HEADER_Y - HEADER_PAD));
 }
 
@@ -3788,22 +3876,22 @@ static void draw_ctrlcfg_bottom_bar(void)
    {
       float sx, sy, sw, sh;
       cover_src_rect(pause_photo_tex, (float)SCREEN_W, (float)BAR_H, &sx, &sy, &sw, &sh);
-      vita2d_draw_texture_part_scale(pause_photo_tex, 0.0f, (float)BAR_Y,
+      gfx_draw_texture_part_scale(pause_photo_tex, 0.0f, (float)BAR_Y,
             sx, sy, sw, sh, (float)SCREEN_W / sw, (float)BAR_H / sh);
    }
    else
    {
-      vita2d_draw_rectangle(0, BAR_Y, SCREEN_W, BAR_H, RGBA8(10, 26, 52, 255));
+      gfx_draw_rectangle(0, BAR_Y, SCREEN_W, BAR_H, RGBA8(10, 26, 52, 255));
    }
 
    int cy = BAR_Y + BAR_H / 2;
 
-   vita2d_font_draw_text(font, CTRLCFG_BAR_SIDE_PAD, cy + (int)(MARQUEE_FONT_SIZE * 0.35f),
+   gfx_font_draw_text(font, CTRLCFG_BAR_SIDE_PAD, cy + (int)(MARQUEE_FONT_SIZE * 0.35f),
          RGBA8(170, 184, 210, 255), MARQUEE_FONT_SIZE, CTRLCFG_BAR_HINT);
 
    // right-aligned circle+"back" prompt, same icon-plus-label layout
    // draw_ps_prompt already uses for every other bottom-bar entry
-   int back_label_w = vita2d_font_text_width(font, MARQUEE_FONT_SIZE, "Back");
+   int back_label_w = gfx_font_text_width(font, MARQUEE_FONT_SIZE, "Back");
    int back_total_w = ICON_SIZE + 8 + back_label_w;
    int back_x = SCREEN_W - CTRLCFG_BAR_SIDE_PAD - back_total_w;
 
@@ -3912,8 +4000,7 @@ static void controller_settings_menu(unsigned game_idx, void (*draw_backdrop)(vo
          return;
       }
 
-      vita2d_start_drawing();
-      vita2d_clear_screen();
+      gfx_begin_frame();
 
       // keep whatever screen opened this one rendering underneath as a
       // static frame -- this screen is an overlay on top of it, not a
@@ -3939,8 +4026,7 @@ static void controller_settings_menu(unsigned game_idx, void (*draw_backdrop)(vo
       // marquee while this screen owns the frame
       draw_ctrlcfg_bottom_bar();
 
-      vita2d_end_drawing();
-      vita2d_swap_buffers();
+      gfx_end_frame();
    }
 }
 
@@ -4072,13 +4158,13 @@ static void show_two_line_popup(const char *line1, const char *line2)
    int msg_y = ROMPOPUP_PANEL_Y + ROMPOPUP_PANEL_H / 2 - ROMPOPUP_MSG_LINE_H / 2;
    int ok_y  = ROMPOPUP_PANEL_Y + ROMPOPUP_PANEL_H - ROMPOPUP_OK_BOTTOM_PAD;
 
-   int w1 = vita2d_font_text_width(font, ROMPOPUP_MSG_FONT_SIZE, line1);
-   int w2 = vita2d_font_text_width(font, ROMPOPUP_MSG_FONT_SIZE, line2);
+   int w1 = gfx_font_text_width(font, ROMPOPUP_MSG_FONT_SIZE, line1);
+   int w2 = gfx_font_text_width(font, ROMPOPUP_MSG_FONT_SIZE, line2);
 
    // real cross-button icon in place of the old "[X]" text, same
    // icon+gap convention draw_ps_prompt uses for the bottom marquee bar
    int ok_icon_w = btn_cross_tex ? (ICON_SIZE + ROMPOPUP_OK_ICON_GAP) : 0;
-   int ok_label_w = vita2d_font_text_width(font, ROMPOPUP_OK_FONT_SIZE, ok_label);
+   int ok_label_w = gfx_font_text_width(font, ROMPOPUP_OK_FONT_SIZE, ok_label);
    int wo = ok_icon_w + ok_label_w;
    int ok_x = cx - wo / 2;
 
@@ -4098,8 +4184,7 @@ static void show_two_line_popup(const char *line1, const char *line2)
       if (pressed & SCE_CTRL_CROSS)
          return;
 
-      vita2d_start_drawing();
-      vita2d_clear_screen();
+      gfx_begin_frame();
 
       draw_menu_backdrop();
 
@@ -4110,13 +4195,12 @@ static void show_two_line_popup(const char *line1, const char *line2)
 
       if (btn_cross_tex)
       {
-         float s = (float)ICON_SIZE / (float)vita2d_texture_get_width(btn_cross_tex);
-         vita2d_draw_texture_scale(btn_cross_tex, (float)ok_x, (float)(ok_icon_cy - ICON_SIZE / 2), s, s);
+         float s = (float)ICON_SIZE / (float)gfx_texture_get_width(btn_cross_tex);
+         gfx_draw_texture_scale(btn_cross_tex, (float)ok_x, (float)(ok_icon_cy - ICON_SIZE / 2), s, s);
       }
       draw_text_outline_l(ok_x + ok_icon_w, ok_y, ROMPOPUP_OK_FONT_SIZE, ok_label);
 
-      vita2d_end_drawing();
-      vita2d_swap_buffers();
+      gfx_end_frame();
    }
 }
 
@@ -4173,6 +4257,9 @@ static int run_menu(void)
          // up/down steps focus through the card grid, version row, and
          // player row in that order, one row per press, clamped at both
          // ends rather than wrapping around
+         if (carousel_online)
+            pressed &= ~(unsigned)(SCE_CTRL_UP | SCE_CTRL_DOWN);
+
          if (pressed & SCE_CTRL_UP)
          {
             if (focus == MENU_FOCUS_PLAYER)
@@ -4230,6 +4317,14 @@ static int run_menu(void)
 
          if (pressed & (SCE_CTRL_CROSS | SCE_CTRL_START))
          {
+            // online, the rom that actually boots is whatever the host
+            // picked, so the lobby does its own checking once that's known
+            if (carousel_online)
+            {
+               sfx_play(sfx_select_pcm, sfx_select_frames);
+               return sel;
+            }
+
             if (resolve_rom_filename(sel, pending_rom_file, sizeof(pending_rom_file)))
             {
                // the game's own announcer stinger no longer plays (or
@@ -4292,15 +4387,13 @@ static int run_menu(void)
       // advance the bottom-bar ticker offset for this frame
       marquee_offset = (float)sceKernelGetProcessTimeWide() / 1000000.0f * MARQUEE_SPEED;
 
-      vita2d_start_drawing();
-      vita2d_clear_screen();
+      gfx_begin_frame();
 
       draw_main_menu_scene(sel, base_sel, shift, focus);
 
       draw_bottom_bar();
 
-      vita2d_end_drawing();
-      vita2d_swap_buffers();
+      gfx_end_frame();
    }
 }
 
@@ -4329,10 +4422,67 @@ static void core_audio_port_close(void)
    }
 }
 
+// frame timing for one game, written to core_log.txt once it closes (a
+// write mid-game would cost a frame by itself). "core" is retro_run alone,
+// "frame" is the whole loop including present and the wait for vsync
+static struct {
+   unsigned frames, over;
+   SceInt64 core_us, core_worst, frame_us, frame_worst, last;
+} perf;
+
+static void perf_begin(void)
+{
+   memset(&perf, 0, sizeof(perf));
+}
+
+// a pause menu or a stall isn't a frame, the next one starts fresh
+static void perf_break(void)
+{
+   perf.last = 0;
+}
+
+static void perf_frame(SceInt64 core_start, SceInt64 core_end)
+{
+   SceInt64 core = core_end - core_start;
+
+   perf.core_us += core;
+   if (core > perf.core_worst)
+      perf.core_worst = core;
+
+   if (perf.last)
+   {
+      SceInt64 frame = core_end - perf.last;
+
+      perf.frames++;
+      perf.frame_us += frame;
+      if (frame > perf.frame_worst)
+         perf.frame_worst = frame;
+      if (frame > 17500)
+         perf.over++;
+   }
+
+   perf.last = core_end;
+}
+
+static void perf_report(const char *where)
+{
+   if (!perf.frames)
+      return;
+
+   core_log(RETRO_LOG_INFO,
+         "perf (%s): %u frames, core avg %.2f ms worst %.2f, frame avg %.2f ms (%.1f fps) worst %.2f, "
+         "%u frames over 17.5 ms\n",
+         where, perf.frames,
+         perf.core_us / 1000.0 / (perf.frames + 1), perf.core_worst / 1000.0,
+         perf.frame_us / 1000.0 / perf.frames, 1e6 * perf.frames / (double)perf.frame_us,
+         perf.frame_worst / 1000.0, perf.over);
+}
+
 static void run_core(void)
 {
    SceCtrlData pad_prev;
    memset(&pad_prev, 0, sizeof(pad_prev));
+   perf_begin();
 
    for (;;)
    {
@@ -4354,6 +4504,7 @@ static void run_core(void)
             break;
 
          core_audio_port_open();
+         perf_break();
 
          // flush here, not a bare memset like the entry above -- whichever
          // button just closed the pause menu (circle, or cross on resume)
@@ -4367,9 +4518,13 @@ static void run_core(void)
          continue;
       }
 
+      SceInt64 core_start = sceKernelGetProcessTimeWide();
       core_api.run();
+      perf_frame(core_start, sceKernelGetProcessTimeWide());
       blit_frame();
    }
+
+   perf_report("offline");
 
    // unload_game()/deinit() run back to back in main(), right after this
    // function returns
@@ -4406,6 +4561,7 @@ static void create_data_dirs(void)
    sceIoMkdir("ux0:data/NaohAC/saves", 0777);
    sceIoMkdir("ux0:data/NaohAC/system", 0777);
    sceIoMkdir(CONFIG_DIR, 0777);
+   sceIoMkdir(ONLINE_SAVE_DIR, 0777);
 }
 
 static bool file_exists(const char *path)
@@ -4616,7 +4772,7 @@ static void migrate_legacy_rom_names(void)
 // already composed for the vita's exact 960x544 output
 typedef enum {
    MAINMENU_OFFLINE_PLAY = 0,
-   MAINMENU_ONLINE_PLAY,     // disabled, purely aesthetic
+   MAINMENU_ONLINE_PLAY,
    MAINMENU_MUSEUM,          // disabled, purely aesthetic
    MAINMENU_FIGHTER_AWARDS,  // disabled, purely aesthetic
    MAINMENU_OPTIONS,
@@ -4632,7 +4788,7 @@ typedef struct {
 
 static const mainmenu_item_t mainmenu_items[MAINMENU_ITEM_COUNT] = {
    { "Offline Play",   "Play offline.",                     true  },
-   { "Online Play",    NULL,                                false },
+   { "Online Play",    "Play against another PS Vita.",     true  },
    { "Museum",          NULL,                                false },
    { "Fighter Awards", NULL,                                false },
    { "Options",         "Change various in-game settings.", true  },
@@ -4663,10 +4819,10 @@ static void draw_mainmenu_backdrop(void)
    if (!mainmenu_bg_tex)
       return;
 
-   float sx = (float)SCREEN_W / (float)vita2d_texture_get_width(mainmenu_bg_tex);
-   float sy = (float)SCREEN_H / (float)vita2d_texture_get_height(mainmenu_bg_tex);
+   float sx = (float)SCREEN_W / (float)gfx_texture_get_width(mainmenu_bg_tex);
+   float sy = (float)SCREEN_H / (float)gfx_texture_get_height(mainmenu_bg_tex);
 
-   vita2d_draw_texture_scale(mainmenu_bg_tex, 0.0f, 0.0f, sx, sy);
+   gfx_draw_texture_scale(mainmenu_bg_tex, 0.0f, 0.0f, sx, sy);
 }
 
 // one row of the main menu list, drawn inside its own panel box. enabled
@@ -4679,7 +4835,7 @@ static void draw_mainmenu_item(int item_y, const mainmenu_item_t *it, bool sel)
 {
    if (!it->enabled)
    {
-      vita2d_font_draw_text(font, MAINMENU_ITEM_X + ITEM_TEXT_PAD,
+      gfx_font_draw_text(font, MAINMENU_ITEM_X + ITEM_TEXT_PAD,
             item_y + (int)(ITEM_FONT_SIZE * 0.35f),
             MAINMENU_DISABLED_COLOR, ITEM_FONT_SIZE, it->label);
       return;
@@ -4715,24 +4871,24 @@ static void draw_mainmenu_bottom_bar(int sel)
    {
       float sx, sy, sw, sh;
       cover_src_rect(pause_photo_tex, (float)SCREEN_W, (float)BAR_H, &sx, &sy, &sw, &sh);
-      vita2d_draw_texture_part_scale(pause_photo_tex, 0.0f, (float)BAR_Y,
+      gfx_draw_texture_part_scale(pause_photo_tex, 0.0f, (float)BAR_Y,
             sx, sy, sw, sh, (float)SCREEN_W / sw, (float)BAR_H / sh);
    }
    else
    {
-      vita2d_draw_rectangle(0, BAR_Y, SCREEN_W, BAR_H, RGBA8(10, 26, 52, 255));
+      gfx_draw_rectangle(0, BAR_Y, SCREEN_W, BAR_H, RGBA8(10, 26, 52, 255));
    }
 
    int cy = BAR_Y + BAR_H / 2;
 
    if (mainmenu_items[sel].description)
-      vita2d_font_draw_text(font, MAINMENU_BAR_SIDE_PAD, cy + (int)(MARQUEE_FONT_SIZE * 0.35f),
+      gfx_font_draw_text(font, MAINMENU_BAR_SIDE_PAD, cy + (int)(MARQUEE_FONT_SIZE * 0.35f),
             RGBA8(170, 184, 210, 255), MARQUEE_FONT_SIZE, mainmenu_items[sel].description);
 
    // right-aligned "x confirm" then "o back", same icon+label layout
    // draw_ps_prompt already uses everywhere else in the app
-   int confirm_label_w = vita2d_font_text_width(font, MARQUEE_FONT_SIZE, "Confirm");
-   int back_label_w    = vita2d_font_text_width(font, MARQUEE_FONT_SIZE, "Back");
+   int confirm_label_w = gfx_font_text_width(font, MARQUEE_FONT_SIZE, "Confirm");
+   int back_label_w    = gfx_font_text_width(font, MARQUEE_FONT_SIZE, "Back");
    int confirm_w = ICON_SIZE + 8 + confirm_label_w;
    int back_w    = ICON_SIZE + 8 + back_label_w;
 
@@ -4743,18 +4899,67 @@ static void draw_mainmenu_bottom_bar(int sel)
    draw_ps_prompt(btn_circ_tex, back_x, cy, "Back");
 }
 
-// small overlay: main menu bgm volume only, left/right steps it, circle
-// leaves. drawn over a static frame of the main menu itself, same
+// online privacy settings. a random nickname and direct connections are
+// the defaults; both survive a restart in configs/online.cfg
+#define ONLINE_CFG_PATH CONFIG_DIR "/online.cfg"
+
+static bool online_psn_name = false;
+static bool online_hide_ip  = false;
+
+static void load_online_settings(void)
+{
+   char line[64];
+   FILE *f = fopen(ONLINE_CFG_PATH, "r");
+   int v;
+
+   if (!f)
+      return;
+
+   while (fgets(line, sizeof(line), f))
+   {
+      if (sscanf(line, "psn_name=%d", &v) == 1)
+         online_psn_name = v != 0;
+      else if (sscanf(line, "hide_ip=%d", &v) == 1)
+         online_hide_ip = v != 0;
+   }
+
+   fclose(f);
+}
+
+static void save_online_settings(void)
+{
+   FILE *f = fopen(ONLINE_CFG_PATH, "w");
+
+   if (!f)
+      return;
+
+   fprintf(f, "psn_name=%d\nhide_ip=%d\n", online_psn_name ? 1 : 0, online_hide_ip ? 1 : 0);
+   fclose(f);
+}
+
+// small overlay over a static frame of the main menu itself, same
 // freeze-the-screen-behind/overlay-a-panel-on-top pattern
-// controller_settings_menu uses over the carousel
-#define MAINMENU_VOL_PANEL_W CTRLCFG_PANEL_W
-#define MAINMENU_VOL_PANEL_H 160
-#define MAINMENU_VOL_PANEL_X CTRLCFG_PANEL_X
-#define MAINMENU_VOL_PANEL_Y ((SCREEN_H - MAINMENU_VOL_PANEL_H) / 2)
-#define MAINMENU_VOL_ROW_Y   (MAINMENU_VOL_PANEL_Y + MAINMENU_VOL_PANEL_H / 2)
+// controller_settings_menu uses over the carousel. up/down picks a row,
+// left/right changes it, circle leaves
+#define MAINMENU_OPT_PANEL_W  CTRLCFG_PANEL_W
+#define MAINMENU_OPT_PANEL_H  210
+#define MAINMENU_OPT_PANEL_X  CTRLCFG_PANEL_X
+#define MAINMENU_OPT_PANEL_Y  ((SCREEN_H - MAINMENU_OPT_PANEL_H) / 2)
+#define MAINMENU_OPT_ITEM_X   CTRLCFG_ITEM_X
+#define MAINMENU_OPT_ITEM_W   CTRLCFG_ITEM_W
+#define MAINMENU_OPT_ROW_Y    (MAINMENU_OPT_PANEL_Y + 44)
+#define MAINMENU_OPT_NOTE_Y   (MAINMENU_OPT_PANEL_Y + MAINMENU_OPT_PANEL_H - 22)
+
+enum { OPTROW_BGM = 0, OPTROW_NAME, OPTROW_HIDE_IP, OPTROW_COUNT };
 
 static void mainmenu_options_submenu(void)
 {
+   static const char *const notes[OPTROW_COUNT] = {
+      "Volume of the music in the menus.",
+      "Anonymous gives you a new random nickname each session.",
+      "On: always play through the encrypted relay, a bit more lag."
+   };
+   int sel = OPTROW_BGM;
    SceCtrlData pad_prev;
 
    flush_pad(&pad_prev);
@@ -4763,24 +4968,37 @@ static void mainmenu_options_submenu(void)
    {
       unsigned pressed = poll_pressed(&pad_prev);
 
+      if (pressed & SCE_CTRL_UP)
+         sel = (sel == 0) ? OPTROW_COUNT - 1 : sel - 1;
+      if (pressed & SCE_CTRL_DOWN)
+         sel = (sel + 1) % OPTROW_COUNT;
+      if (pressed & (SCE_CTRL_UP | SCE_CTRL_DOWN))
+         sfx_play(sfx_choose_pcm, sfx_choose_frames);
+
       if (pressed & (SCE_CTRL_LEFT | SCE_CTRL_RIGHT))
       {
          // d-pad adjusting a live setting value, not confirming anything --
          // choose.ogg, same as any other value cycle
          sfx_play(sfx_choose_pcm, sfx_choose_frames);
 
-         if (pressed & SCE_CTRL_RIGHT)
+         if (sel == OPTROW_BGM)
          {
-            if (mainmenu_bgm_volume < MAINMENU_BGM_VOLUME_MAX)
+            if ((pressed & SCE_CTRL_RIGHT) && mainmenu_bgm_volume < MAINMENU_BGM_VOLUME_MAX)
                mainmenu_bgm_volume++;
+            else if ((pressed & SCE_CTRL_LEFT) && mainmenu_bgm_volume > 0)
+               mainmenu_bgm_volume--;
+
+            apply_mainmenu_bgm_volume();
          }
          else
          {
-            if (mainmenu_bgm_volume > 0)
-               mainmenu_bgm_volume--;
-         }
+            if (sel == OPTROW_NAME)
+               online_psn_name = !online_psn_name;
+            else
+               online_hide_ip = !online_hide_ip;
 
-         apply_mainmenu_bgm_volume();
+            save_online_settings();
+         }
       }
 
       if (pressed & SCE_CTRL_CIRCLE)
@@ -4789,39 +5007,66 @@ static void mainmenu_options_submenu(void)
          return;
       }
 
-      vita2d_start_drawing();
-      vita2d_clear_screen();
+      gfx_begin_frame();
 
       draw_mainmenu_backdrop();
       draw_panel_box(MAINMENU_PANEL_X, MAINMENU_PANEL_Y, MAINMENU_PANEL_W, MAINMENU_PANEL_H);
       draw_mainmenu_list(MAINMENU_OPTIONS);
 
-      draw_panel_box(MAINMENU_VOL_PANEL_X, MAINMENU_VOL_PANEL_Y,
-            MAINMENU_VOL_PANEL_W, MAINMENU_VOL_PANEL_H);
+      draw_panel_box(MAINMENU_OPT_PANEL_X, MAINMENU_OPT_PANEL_Y,
+            MAINMENU_OPT_PANEL_W, MAINMENU_OPT_PANEL_H);
+
+      for (int i = 0; i < OPTROW_COUNT; i++)
+      {
+         char value[16];
+         char line[64];
+         const char *label;
+         int y = MAINMENU_OPT_ROW_Y + i * ITEM_SPACING_MAIN;
+
+         if (i == OPTROW_BGM)
+         {
+            label = "Main Menu BGM Volume";
+            snprintf(value, sizeof(value), "%d%%", mainmenu_bgm_volume * 10);
+         }
+         else if (i == OPTROW_NAME)
+         {
+            label = "Online Name";
+            snprintf(value, sizeof(value), "%s", online_psn_name ? "PSN Name" : "Anonymous");
+         }
+         else
+         {
+            label = "Hide My IP Online";
+            snprintf(value, sizeof(value), "%s", online_hide_ip ? "On" : "Off");
+         }
+
+         if (i == sel)
+         {
+            draw_pause_hilite_at(MAINMENU_OPT_ITEM_X, y, MAINMENU_OPT_ITEM_W);
+            snprintf(line, sizeof(line), "%s: < %s >", label, value);
+         }
+         else
+            snprintf(line, sizeof(line), "%s: %s", label, value);
+
+         draw_item_label_at(MAINMENU_OPT_ITEM_X, y, MAINMENU_OPT_ITEM_W, line);
+      }
 
       {
-         char line[32];
-         int lw;
+         int nw = gfx_font_text_width(font, 16, notes[sel]);
 
-         snprintf(line, sizeof(line), "Main Menu BGM Volume: < %d%% >",
-               mainmenu_bgm_volume * 10);
-
-         lw = vita2d_font_text_width(font, ITEM_FONT_SIZE, line);
-         draw_text_outline_l(MAINMENU_VOL_PANEL_X + (MAINMENU_VOL_PANEL_W - lw) / 2,
-               MAINMENU_VOL_ROW_Y, ITEM_FONT_SIZE, line);
+         gfx_font_draw_text(font, MAINMENU_OPT_PANEL_X + (MAINMENU_OPT_PANEL_W - nw) / 2,
+               MAINMENU_OPT_NOTE_Y, MAINMENU_DISABLED_COLOR, 16, notes[sel]);
       }
 
       draw_mainmenu_bottom_bar(MAINMENU_OPTIONS);
 
-      vita2d_end_drawing();
-      vita2d_swap_buffers();
+      gfx_end_frame();
    }
 }
 
-// main menu loop. returns MAINMENU_OFFLINE_PLAY, MAINMENU_QUIT, or
-// MAINMENU_ACTION_BACK_TO_TITLE, the only three outcomes the caller
-// (main()) needs to act on -- options is handled right here as a self-
-// contained overlay, and the three grayed rows can never be reached at all
+// main menu loop. returns MAINMENU_OFFLINE_PLAY, MAINMENU_ONLINE_PLAY,
+// MAINMENU_QUIT, or MAINMENU_ACTION_BACK_TO_TITLE, the only outcomes the
+// caller (main()) needs to act on -- options is handled right here as a
+// self-contained overlay, and the two grayed rows can never be reached at all
 #define MAINMENU_ACTION_BACK_TO_TITLE (-1)
 
 // how long the fade in from black takes on entry, a bit quicker than the
@@ -4863,17 +5108,15 @@ static int run_main_menu(void)
 
          unsigned char overlay_alpha = (unsigned char)((1.0f - fade_t) * 255.0f + 0.5f);
 
-         vita2d_start_drawing();
-         vita2d_clear_screen();
+         gfx_begin_frame();
 
          draw_mainmenu_backdrop();
          draw_panel_box(MAINMENU_PANEL_X, MAINMENU_PANEL_Y, MAINMENU_PANEL_W, MAINMENU_PANEL_H);
          draw_mainmenu_list(sel);
          draw_mainmenu_bottom_bar(sel);
-         vita2d_draw_rectangle(0, 0, SCREEN_W, SCREEN_H, RGBA8(0, 0, 0, overlay_alpha));
+         gfx_draw_rectangle(0, 0, SCREEN_W, SCREEN_H, RGBA8(0, 0, 0, overlay_alpha));
 
-         vita2d_end_drawing();
-         vita2d_swap_buffers();
+         gfx_end_frame();
 
          if (fade_t >= 1.0f)
             break;
@@ -4902,6 +5145,9 @@ static int run_main_menu(void)
          if (sel == MAINMENU_OFFLINE_PLAY)
             return MAINMENU_OFFLINE_PLAY;
 
+         if (sel == MAINMENU_ONLINE_PLAY)
+            return MAINMENU_ONLINE_PLAY;
+
          if (sel == MAINMENU_OPTIONS)
          {
             mainmenu_options_submenu();
@@ -4925,17 +5171,260 @@ static int run_main_menu(void)
          continue;
       }
 
-      vita2d_start_drawing();
-      vita2d_clear_screen();
+      gfx_begin_frame();
 
       draw_mainmenu_backdrop();
       draw_panel_box(MAINMENU_PANEL_X, MAINMENU_PANEL_Y, MAINMENU_PANEL_W, MAINMENU_PANEL_H);
       draw_mainmenu_list(sel);
       draw_mainmenu_bottom_bar(sel);
 
-      vita2d_end_drawing();
-      vita2d_swap_buffers();
+      gfx_end_frame();
    }
+}
+
+// everything between "a game was picked" and "first playable frame":
+// core setup, the now loading screen, rom load, warm-up and audio. online
+// matches skip the european fallback (both vitas have to end up on the
+// exact same rom) and auto-resume. false means it already told the player
+// why and the core is torn back down
+// wipes this rom's nvram from the online scratch folder and drops the
+// bundled factory copy back in, if there is one. no copy is fine too: the
+// core then starts from its own built-in defaults, same on both sides
+static void reset_online_nvram(const char *rom_file)
+{
+   char stem[64];
+   char src[192];
+   char dst[192];
+   size_t len = strlen(rom_file);
+
+   if (len > 4 && !strcmp(rom_file + len - 4, ".zip"))
+      len -= 4;
+   snprintf(stem, sizeof(stem), "%.*s", (int)len, rom_file);
+
+   snprintf(dst, sizeof(dst), "%s/%s.nv", ONLINE_SAVE_DIR, stem);
+   sceIoRemove(dst);
+
+   snprintf(src, sizeof(src), "%s%s.nv", NVRAM_ASSET_DIR, stem);
+   if (file_exists(src) && !copy_file(src, dst))
+      netplay_log("match: couldn't seed factory nvram for %s", stem);
+}
+
+static bool boot_selected_game(int selected_game_idx, bool online)
+{
+   if (online)
+   {
+      reset_online_nvram(pending_rom_file);
+      core_save_dir = ONLINE_SAVE_DIR;
+   }
+   else
+      core_save_dir = SAVE_DIR;
+
+   current_game_idx = selected_game_idx;
+   active_player_port = game_player_port[selected_game_idx];
+   bind_core_api(games[selected_game_idx].core);
+
+   core_api.set_environment(environment_cb);
+   core_api.set_video_refresh(video_refresh_cb);
+   core_api.set_audio_sample(audio_sample_cb);
+   core_api.set_audio_sample_batch(audio_sample_batch_cb);
+   core_api.set_input_poll(input_poll_cb);
+   core_api.set_input_state(input_state_cb);
+
+   core_api.init();
+
+   struct retro_game_info game;
+   char rom_path[192];
+   char load_rom_file[64];
+   int rom_path_len;
+   bool loaded;
+
+   memset(&game, 0, sizeof(game));
+   memset(rom_path, 0, sizeof(rom_path));
+   snprintf(load_rom_file, sizeof(load_rom_file), "%s", pending_rom_file);
+
+   {
+      // switch to the now loading screen immediately instead of
+      // freezing on the announcer stinger -- it plays on its own
+      // thread (see play_game_announcer_async) while this loop keeps
+      // swapping buffers every frame, and only lets the core boot
+      // once that thread reports it's actually finished
+      gfx_texture *cover_texture = cover_tex[games[selected_game_idx].known_idx];
+
+      play_game_announcer_async(games[selected_game_idx].known_idx);
+
+      do
+      {
+         gfx_begin_frame();
+
+         if (loading_bg)
+            gfx_draw_texture(loading_bg, 0, 0);
+
+         if (cover_texture)
+            gfx_draw_texture(cover_texture, 264, 122);
+
+         gfx_end_frame();
+      }
+      while (announcer_playing);
+
+      if (announcer_thread_id >= 0)
+      {
+         sceKernelWaitThreadEnd(announcer_thread_id, NULL, NULL);
+         sceKernelDeleteThread(announcer_thread_id);
+         announcer_thread_id = -1;
+      }
+   }
+
+   // --- load: hand the rom to the core ---
+
+   // almost every attempt loads on the first try. the second pass
+   // exists purely as a safety net for whatever region the player had
+   // selected turning out to be unsupported by this exact core build
+   // (wrong driver name for that clone, a variant this core was never
+   // compiled with, a corrupt dump, etc), it quietly retries once
+   // against the known good european parent set instead of just
+   // rejecting the player outright. the original failure is still
+   // written to core_log.txt either way, this only changes what the
+   // player sees, and it never runs at all if they were already on
+   // the european region or if the european set isn't even on disk
+   loaded = false;
+
+   for (int attempt = 0; attempt < (online ? 1 : 2) && !loaded; attempt++)
+   {
+      if (attempt == 1)
+      {
+         unsigned known_idx = games[selected_game_idx].known_idx;
+         const char *const *eu_list;
+         bool found = false;
+
+         if ((rom_region_t)game_region[selected_game_idx] == REGION_EUROPE)
+            break;
+
+         eu_list = region_file_list(known_idx, REGION_EUROPE);
+
+         for (unsigned v = 0; v < ROM_VARIANT_MAX && eu_list[v]; v++)
+         {
+            char eu_full[192];
+
+            snprintf(eu_full, sizeof(eu_full), "%s%s", ROM_DIR, eu_list[v]);
+
+            if (file_exists(eu_full))
+            {
+               snprintf(load_rom_file, sizeof(load_rom_file), "%s", eu_list[v]);
+               found = true;
+               break;
+            }
+         }
+
+         if (!found)
+            break;
+
+         core_log(RETRO_LOG_INFO,
+               "naohac: \"%s\" failed to load on the selected region, "
+               "falling back to the european set \"%s\"\n",
+               games[selected_game_idx].label, load_rom_file);
+      }
+
+      rom_path_len = snprintf(rom_path, sizeof(rom_path), "%s%s",
+            ROM_DIR, load_rom_file);
+      if (rom_path_len < 0 || (size_t)rom_path_len >= sizeof(rom_path))
+      {
+         core_log(RETRO_LOG_ERROR,
+               "naohac: rom path construction overflow for \"%s\"\n",
+               load_rom_file);
+         break;
+      }
+
+      rom_path[sizeof(rom_path) - 1] = '\0';
+      game.path = rom_path;
+
+      // purely diagnostic, logged before the call so it's on record even
+      // if load_game itself never gets a chance to log anything. driver
+      // name here is load_rom_file with ".zip" stripped, i.e. exactly
+      // what mame2000 will try to match against its own compiled-in
+      // driver table before it ever opens the archive. if this line is
+      // followed by a bare rejection with no further core-side output in
+      // core_log.txt, that's the signature of this build's mame_retro
+      // simply not having that driver name compiled in at all (common on
+      // size-trimmed builds that keep only one variant per game) rather
+      // than anything wrong with the rom file itself
+      {
+         char driver_name[64];
+         size_t dn_len = strlen(load_rom_file);
+
+         if (dn_len > 4 && !strcmp(load_rom_file + dn_len - 4, ".zip"))
+            dn_len -= 4;
+
+         snprintf(driver_name, sizeof(driver_name), "%.*s", (int)dn_len, load_rom_file);
+
+         core_log(RETRO_LOG_INFO,
+               "naohac: loading \"%s\" via %s core (driver name \"%s\")\n",
+               rom_path,
+               (games[selected_game_idx].core == CORE_KIND_MAME) ? "mame2000" : "fba2012",
+               driver_name);
+      }
+
+      if (core_api.load_game(&game))
+      {
+         loaded = true;
+      }
+      else
+      {
+         core_log(RETRO_LOG_ERROR,
+               "naohac: load_game failed for \"%s\" (%s)\n",
+               games[selected_game_idx].label, rom_path);
+      }
+   }
+
+   if (!loaded)
+   {
+      core_api.deinit();
+      load_fail_popup(games[selected_game_idx].core);
+      return false;
+   }
+
+   set_current_rom_stem(load_rom_file);
+   game_loaded = true;
+
+   // --- warm-up: burn past boot logos/warnings on every load ---
+
+   warm_up_core(CORE_WARMUP_FRAMES);
+
+   // --- auto-resume: reapply the last quick save, if any ---
+
+   // never online though, a match always starts from a clean boot and the
+   // host's own state gets pushed across right after this anyway
+   if (!online)
+      attempt_auto_resume(current_rom_stem);
+
+   struct retro_system_av_info av_info;
+   core_api.get_system_av_info(&av_info);
+
+   // pull in whatever wallpaper/effects/filter/size this rom was last
+   // left on
+   load_game_config();
+
+   tex_w = 0;
+   tex_h = 0;
+
+   core_port_rate = snap_sample_rate(av_info.timing.sample_rate);
+   core_port_type = (core_port_rate == 44100 || core_port_rate == 48000)
+         ? SCE_AUDIO_OUT_PORT_TYPE_BGM
+         : SCE_AUDIO_OUT_PORT_TYPE_VOICE;
+
+   core_audio_port_open();
+
+   return true;
+}
+
+static void shutdown_game(void)
+{
+   if (game_loaded)
+   {
+      core_api.unload_game();
+      game_loaded = false;
+   }
+
+   core_api.deinit();
 }
 
 // offline-play flow: repeatedly drops into the game carousel and, once a
@@ -4956,198 +5445,8 @@ static void run_offline_play(void)
       if (selected_game_idx < 0)
          return; // circle pressed in the carousel, back out to the main menu
 
-      current_game_idx = selected_game_idx;
-      active_player_port = game_player_port[selected_game_idx];
-      bind_core_api(games[selected_game_idx].core);
-
-      core_api.set_environment(environment_cb);
-      core_api.set_video_refresh(video_refresh_cb);
-      core_api.set_audio_sample(audio_sample_cb);
-      core_api.set_audio_sample_batch(audio_sample_batch_cb);
-      core_api.set_input_poll(input_poll_cb);
-      core_api.set_input_state(input_state_cb);
-
-      core_api.init();
-
-      struct retro_game_info game;
-      char rom_path[192];
-      char load_rom_file[64];
-      int rom_path_len;
-      bool loaded;
-
-      memset(&game, 0, sizeof(game));
-      memset(rom_path, 0, sizeof(rom_path));
-      snprintf(load_rom_file, sizeof(load_rom_file), "%s", pending_rom_file);
-
-      {
-         // switch to the now loading screen immediately instead of
-         // freezing on the announcer stinger -- it plays on its own
-         // thread (see play_game_announcer_async) while this loop keeps
-         // swapping buffers every frame, and only lets the core boot
-         // once that thread reports it's actually finished
-         vita2d_texture *cover_texture = cover_tex[games[selected_game_idx].known_idx];
-
-         play_game_announcer_async(games[selected_game_idx].known_idx);
-
-         do
-         {
-            vita2d_start_drawing();
-            vita2d_clear_screen();
-
-            if (loading_bg)
-               vita2d_draw_texture(loading_bg, 0, 0);
-
-            if (cover_texture)
-               vita2d_draw_texture(cover_texture, 264, 122);
-
-            vita2d_end_drawing();
-            vita2d_swap_buffers();
-         }
-         while (announcer_playing);
-
-         if (announcer_thread_id >= 0)
-         {
-            sceKernelWaitThreadEnd(announcer_thread_id, NULL, NULL);
-            sceKernelDeleteThread(announcer_thread_id);
-            announcer_thread_id = -1;
-         }
-      }
-
-      // --- load: hand the rom to the core ---
-
-      // almost every attempt loads on the first try. the second pass
-      // exists purely as a safety net for whatever region the player had
-      // selected turning out to be unsupported by this exact core build
-      // (wrong driver name for that clone, a variant this core was never
-      // compiled with, a corrupt dump, etc), it quietly retries once
-      // against the known good european parent set instead of just
-      // rejecting the player outright. the original failure is still
-      // written to core_log.txt either way, this only changes what the
-      // player sees, and it never runs at all if they were already on
-      // the european region or if the european set isn't even on disk
-      loaded = false;
-
-      for (int attempt = 0; attempt < 2 && !loaded; attempt++)
-      {
-         if (attempt == 1)
-         {
-            unsigned known_idx = games[selected_game_idx].known_idx;
-            const char *const *eu_list;
-            bool found = false;
-
-            if ((rom_region_t)game_region[selected_game_idx] == REGION_EUROPE)
-               break;
-
-            eu_list = region_file_list(known_idx, REGION_EUROPE);
-
-            for (unsigned v = 0; v < ROM_VARIANT_MAX && eu_list[v]; v++)
-            {
-               char eu_full[192];
-
-               snprintf(eu_full, sizeof(eu_full), "%s%s", ROM_DIR, eu_list[v]);
-
-               if (file_exists(eu_full))
-               {
-                  snprintf(load_rom_file, sizeof(load_rom_file), "%s", eu_list[v]);
-                  found = true;
-                  break;
-               }
-            }
-
-            if (!found)
-               break;
-
-            core_log(RETRO_LOG_INFO,
-                  "naohac: \"%s\" failed to load on the selected region, "
-                  "falling back to the european set \"%s\"\n",
-                  games[selected_game_idx].label, load_rom_file);
-         }
-
-         rom_path_len = snprintf(rom_path, sizeof(rom_path), "%s%s",
-               ROM_DIR, load_rom_file);
-         if (rom_path_len < 0 || (size_t)rom_path_len >= sizeof(rom_path))
-         {
-            core_log(RETRO_LOG_ERROR,
-                  "naohac: rom path construction overflow for \"%s\"\n",
-                  load_rom_file);
-            break;
-         }
-
-         rom_path[sizeof(rom_path) - 1] = '\0';
-         game.path = rom_path;
-
-         // purely diagnostic, logged before the call so it's on record even
-         // if load_game itself never gets a chance to log anything. driver
-         // name here is load_rom_file with ".zip" stripped, i.e. exactly
-         // what mame2000 will try to match against its own compiled-in
-         // driver table before it ever opens the archive. if this line is
-         // followed by a bare rejection with no further core-side output in
-         // core_log.txt, that's the signature of this build's mame_retro
-         // simply not having that driver name compiled in at all (common on
-         // size-trimmed builds that keep only one variant per game) rather
-         // than anything wrong with the rom file itself
-         {
-            char driver_name[64];
-            size_t dn_len = strlen(load_rom_file);
-
-            if (dn_len > 4 && !strcmp(load_rom_file + dn_len - 4, ".zip"))
-               dn_len -= 4;
-
-            snprintf(driver_name, sizeof(driver_name), "%.*s", (int)dn_len, load_rom_file);
-
-            core_log(RETRO_LOG_INFO,
-                  "naohac: loading \"%s\" via %s core (driver name \"%s\")\n",
-                  rom_path,
-                  (games[selected_game_idx].core == CORE_KIND_MAME) ? "mame2000" : "fba2012",
-                  driver_name);
-         }
-
-         if (core_api.load_game(&game))
-         {
-            loaded = true;
-         }
-         else
-         {
-            core_log(RETRO_LOG_ERROR,
-                  "naohac: load_game failed for \"%s\" (%s)\n",
-                  games[selected_game_idx].label, rom_path);
-         }
-      }
-
-      if (!loaded)
-      {
-         core_api.deinit();
-         load_fail_popup(games[selected_game_idx].core);
+      if (!boot_selected_game(selected_game_idx, false))
          continue;
-      }
-
-      set_current_rom_stem(load_rom_file);
-      game_loaded = true;
-
-      // --- warm-up: burn past boot logos/warnings on every load ---
-
-      warm_up_core(CORE_WARMUP_FRAMES);
-
-      // --- auto-resume: reapply the last quick save, if any ---
-
-      attempt_auto_resume(current_rom_stem);
-
-      struct retro_system_av_info av_info;
-      core_api.get_system_av_info(&av_info);
-
-      // pull in whatever wallpaper/effects/filter/size this rom was last
-      // left on
-      load_game_config();
-
-      tex_w = 0;
-      tex_h = 0;
-
-      core_port_rate = snap_sample_rate(av_info.timing.sample_rate);
-      core_port_type = (core_port_rate == 44100 || core_port_rate == 48000)
-            ? SCE_AUDIO_OUT_PORT_TYPE_BGM
-            : SCE_AUDIO_OUT_PORT_TYPE_VOICE;
-
-      core_audio_port_open();
 
       // --- run: play until the player exits back to the menu ---
 
@@ -5155,14 +5454,1148 @@ static void run_offline_play(void)
 
       // --- teardown: standard order for every core ---
 
-      if (game_loaded)
+      shutdown_game();
+   }
+}
+
+// online play. pick a game, then either open a room or join somebody
+// else's from the list. no router setup and no typing in addresses: the
+// lobby, matchmaking and nat traversal are all handled in netplay.c. both
+// vitas run the full game and only trade pad input once a match starts
+#define ONLINE_PANEL_W         560
+#define ONLINE_PANEL_H         330
+#define ONLINE_PANEL_X         ((SCREEN_W - ONLINE_PANEL_W) / 2)
+#define ONLINE_PANEL_Y         76
+#define ONLINE_TITLE_Y         (ONLINE_PANEL_Y + 42)
+#define ONLINE_TITLE_FONT_SIZE 22
+#define ONLINE_ITEM_W          494
+#define ONLINE_ITEM_X          (ONLINE_PANEL_X + 33)
+#define ONLINE_ITEM_START_Y    (ONLINE_PANEL_Y + 92)
+#define ONLINE_VISIBLE_ROOMS   5
+
+#define ONLINE_BAR_SIDE_PAD    20
+#define ONLINE_BAR_PROMPT_GAP  28
+
+#define ONLINE_BOX_LINE_Y      (PROMPT_PANEL_Y + 62)
+#define ONLINE_BOX_LINE_H      34
+
+#define NET_BANNER_W           460
+#define NET_BANNER_H           92
+#define NET_BANNER_X           ((SCREEN_W - NET_BANNER_W) / 2)
+#define NET_BANNER_Y           24
+#define NET_STALL_BANNER_US    250000
+
+#define ROM_CRC_BUF_SIZE       (64 * 1024)
+
+static int  online_game_idx;
+static char online_title[96];
+static bool online_leave_open;
+static bool online_stalled;
+
+// crc of the whole zip, so two players with different dumps under the
+// same filename get stopped in the lobby instead of desyncing mid-match.
+// only the last result is kept around, which covers hosting/joining the
+// same game over and over without rereading 40mb each time
+static bool rom_file_crc(const char *file, uint32_t *out)
+{
+   static char cached_file[64];
+   static uint32_t cached_crc;
+   char path[192];
+   unsigned char *buf;
+   uLong crc;
+   size_t n;
+   FILE *f;
+
+   if (cached_file[0] && !strcmp(cached_file, file))
+   {
+      *out = cached_crc;
+      return true;
+   }
+
+   snprintf(path, sizeof(path), "%s%s", ROM_DIR, file);
+   f = fopen(path, "rb");
+   if (!f)
+      return false;
+
+   buf = malloc(ROM_CRC_BUF_SIZE);
+   if (!buf)
+   {
+      fclose(f);
+      return false;
+   }
+
+   crc = crc32(0L, Z_NULL, 0);
+   while ((n = fread(buf, 1, ROM_CRC_BUF_SIZE, f)) > 0)
+      crc = crc32(crc, buf, (uInt)n);
+
+   free(buf);
+   fclose(f);
+
+   snprintf(cached_file, sizeof(cached_file), "%s", file);
+   cached_crc = (uint32_t)crc;
+   *out = cached_crc;
+   return true;
+}
+
+// which region slot of known game known_idx lists this exact zip, -1 if
+// it isn't one of that game's files at all
+static int rom_region_of(unsigned known_idx, const char *file)
+{
+   for (int r = 0; r < REGION_COUNT; r++)
+   {
+      const char *const *list = region_file_list(known_idx, (rom_region_t)r);
+
+      for (unsigned v = 0; v < ROM_VARIANT_MAX && list[v]; v++)
       {
-         core_api.unload_game();
-         game_loaded = false;
+         if (!strcmp(list[v], file))
+            return r;
+      }
+   }
+
+   return -1;
+}
+
+// first file of this game's region that's actually on the memory card,
+// same order resolve_rom_filename walks but without logging every miss
+static bool owned_rom_file(unsigned known_idx, int region, char *out, size_t out_sz)
+{
+   const char *const *list = region_file_list(known_idx, (rom_region_t)region);
+
+   for (unsigned v = 0; v < ROM_VARIANT_MAX && list[v]; v++)
+   {
+      char full[192];
+
+      snprintf(full, sizeof(full), "%s%s", ROM_DIR, list[v]);
+      if (file_exists(full))
+      {
+         if (out)
+            snprintf(out, out_sz, "%s", list[v]);
+         return true;
+      }
+   }
+
+   return false;
+}
+
+static void refresh_online_owned(void)
+{
+   for (unsigned k = 0; k < KNOWN_COUNT; k++)
+   {
+      online_owned[k] = 0;
+      for (int r = 0; r < REGION_COUNT; r++)
+      {
+         if (owned_rom_file(k, r, NULL, 0))
+            online_owned[k] |= (unsigned char)(1u << r);
+      }
+   }
+}
+
+// whether the exact zip a room was opened with is on our card. rooms come
+// and go every few seconds, so each filename only gets checked once per
+// visit to the room list
+static struct {
+   char file[NETPLAY_ROM_LEN];
+   bool have;
+} room_files[NETPLAY_MAX_ROOMS * 2];
+static int room_file_count;
+
+static bool have_room_rom(const netplay_room_t *room)
+{
+   char full[192];
+
+   if (rom_region_of(games[online_game_idx].known_idx, room->rom) < 0)
+      return false;
+
+   for (int i = 0; i < room_file_count; i++)
+   {
+      if (!strcmp(room_files[i].file, room->rom))
+         return room_files[i].have;
+   }
+
+   snprintf(full, sizeof(full), "%s%s", ROM_DIR, room->rom);
+   if (room_file_count < (int)(sizeof(room_files) / sizeof(room_files[0])))
+   {
+      snprintf(room_files[room_file_count].file, sizeof(room_files[0].file), "%s", room->rom);
+      room_files[room_file_count].have = file_exists(full);
+      return room_files[room_file_count++].have;
+   }
+
+   return file_exists(full);
+}
+
+// same bar art and prompt layout as every other bottom bar in the app,
+// the confirm prompt just drops out on screens where cross does nothing
+static void draw_online_bottom_bar(const char *hint, bool can_confirm)
+{
+   if (pause_photo_tex)
+   {
+      float sx, sy, sw, sh;
+      cover_src_rect(pause_photo_tex, (float)SCREEN_W, (float)BAR_H, &sx, &sy, &sw, &sh);
+      gfx_draw_texture_part_scale(pause_photo_tex, 0.0f, (float)BAR_Y,
+            sx, sy, sw, sh, (float)SCREEN_W / sw, (float)BAR_H / sh);
+   }
+   else
+   {
+      gfx_draw_rectangle(0, BAR_Y, SCREEN_W, BAR_H, RGBA8(10, 26, 52, 255));
+   }
+
+   int cy = BAR_Y + BAR_H / 2;
+
+   if (hint)
+      gfx_font_draw_text(font, ONLINE_BAR_SIDE_PAD, cy + (int)(MARQUEE_FONT_SIZE * 0.35f),
+            RGBA8(170, 184, 210, 255), MARQUEE_FONT_SIZE, hint);
+
+   int back_w = ICON_SIZE + 8 + gfx_font_text_width(font, MARQUEE_FONT_SIZE, "Back");
+   int back_x = SCREEN_W - ONLINE_BAR_SIDE_PAD - back_w;
+
+   draw_ps_prompt(btn_circ_tex, back_x, cy, "Back");
+
+   if (can_confirm)
+   {
+      int confirm_w = ICON_SIZE + 8 + gfx_font_text_width(font, MARQUEE_FONT_SIZE, "Confirm");
+      draw_ps_prompt(btn_cross_tex, back_x - ONLINE_BAR_PROMPT_GAP - confirm_w, cy, "Confirm");
+   }
+}
+
+static void draw_online_title(const char *title)
+{
+   int tw = gfx_font_text_width(font, ONLINE_TITLE_FONT_SIZE, title);
+
+   draw_text_outline_l(ONLINE_PANEL_X + (ONLINE_PANEL_W - tw) / 2, ONLINE_TITLE_Y,
+         ONLINE_TITLE_FONT_SIZE, title);
+}
+
+// carousel frozen on the picked game, the room panel and its title. also
+// what the waiting/joining boxes sit on top of
+static void draw_online_lobby_backdrop(void)
+{
+   draw_main_menu_scene(online_game_idx, online_game_idx, 0.0f, MENU_FOCUS_GAMES);
+   draw_panel_box(ONLINE_PANEL_X, ONLINE_PANEL_Y, ONLINE_PANEL_W, ONLINE_PANEL_H);
+   draw_online_title(online_title);
+}
+
+static void draw_online_note(int item_y, const char *text)
+{
+   int tw = gfx_font_text_width(font, ITEM_FONT_SIZE, text);
+
+   gfx_font_draw_text(font, ONLINE_PANEL_X + (ONLINE_PANEL_W - tw) / 2,
+         item_y + (int)(ITEM_FONT_SIZE * 0.35f), MAINMENU_DISABLED_COLOR, ITEM_FONT_SIZE, text);
+}
+
+// flat dim text for rooms that can't be joined, outlined otherwise
+static void draw_room_text(int x, int y, unsigned size, const char *s, bool dim)
+{
+   if (dim)
+      gfx_font_draw_text(font, x, y, MAINMENU_DISABLED_COLOR, size, s);
+   else
+      draw_text_outline_l(x, y, size, s);
+}
+
+// rounded-off box out of plain rects (all the renderer has), radius ~2px.
+// fine at badge size
+static void draw_pill(int x, int y, int w, int h, unsigned int color)
+{
+   gfx_draw_rectangle(x + 2, y, w - 4, h, color);
+   gfx_draw_rectangle(x + 1, y + 1, 1, h - 2, color);
+   gfx_draw_rectangle(x + w - 2, y + 1, 1, h - 2, color);
+   gfx_draw_rectangle(x, y + 2, 1, h - 4, color);
+   gfx_draw_rectangle(x + w - 1, y + 2, 1, h - 4, color);
+}
+
+// filled circle, one rect per scanline
+static void draw_dot(int cx, int cy, int r, unsigned int color)
+{
+   for (int dy = -r; dy < r; dy++)
+   {
+      float fy = dy + 0.5f;
+      int half = (int)(sqrtf((float)(r * r) - fy * fy) + 0.5f);
+
+      gfx_draw_rectangle(cx - half, cy + dy, half * 2, 1, color);
+   }
+}
+
+static unsigned int with_alpha(unsigned int color, unsigned a)
+{
+   return (color & 0x00FFFFFF) | ((a & 0xFF) << 24);
+}
+
+static const unsigned int region_badge_color[REGION_COUNT] = {
+   RGBA8(46, 96, 172, 255),    // english
+   RGBA8(170, 50, 62, 255),    // japanese
+   RGBA8(40, 132, 102, 255)    // european
+};
+
+#define ROOM_WAITING_COLOR RGBA8(80, 210, 120, 255)
+#define ROOM_PLAYING_COLOR RGBA8(236, 172, 52, 255)
+#define ROOM_NO_ROM_COLOR  RGBA8(150, 150, 150, 255)
+#define ROOM_NAME_W        210
+#define ROOM_BADGE_X       262
+#define ROOM_BADGE_H       22
+#define ROOM_BADGE_FONT    15
+
+typedef enum { ROOM_JOINABLE, ROOM_NO_ROM, ROOM_PLAYING } room_kind_t;
+
+static room_kind_t room_kind(const netplay_room_t *room)
+{
+   if (room->players >= 2)
+      return ROOM_PLAYING;
+   return have_room_rom(room) ? ROOM_JOINABLE : ROOM_NO_ROM;
+}
+
+// one room: status dot, host, version badge, state on the right. rooms
+// that can't be joined right now draw dimmed so the joinable ones stand out
+static void draw_room_row(int item_y, const netplay_room_t *room, bool sel)
+{
+   static const char *kind_text[3] = { "Waiting", "No ROM", "Playing" };
+   static const unsigned int kind_color[3] = { ROOM_WAITING_COLOR, ROOM_NO_ROM_COLOR, ROOM_PLAYING_COLOR };
+
+   room_kind_t kind = room_kind(room);
+   bool dim = kind != ROOM_JOINABLE;
+   int region = rom_region_of(games[online_game_idx].known_idx, room->rom);
+   int x = ONLINE_ITEM_X + ITEM_TEXT_PAD;
+   int y = item_y + (int)(ITEM_FONT_SIZE * 0.35f);
+   unsigned name_size = ITEM_FONT_SIZE;
+   char state[24];
+   int nw, sw;
+
+   if (sel)
+      draw_pause_hilite_at(ONLINE_ITEM_X, item_y, ONLINE_ITEM_W);
+
+   draw_dot(x + 5, item_y, 5, with_alpha(kind_color[kind], dim ? 170 : 255));
+
+   // long nicknames shrink instead of running into the badge
+   nw = gfx_font_text_width(font, name_size, room->name);
+   if (nw > ROOM_NAME_W)
+   {
+      name_size = (unsigned)((float)name_size * ROOM_NAME_W / nw);
+      if (name_size < ITEM_MIN_FONT_SIZE)
+         name_size = ITEM_MIN_FONT_SIZE;
+   }
+   draw_room_text(x + 18, item_y + (int)(name_size * 0.35f), name_size, room->name, dim);
+
+   if (region >= 0)
+   {
+      const char *label = region_short[region];
+      int tw = gfx_font_text_width(font, ROOM_BADGE_FONT, label);
+      int bx = ONLINE_ITEM_X + ROOM_BADGE_X;
+      int bw = tw + 18;
+
+      draw_pill(bx, item_y - ROOM_BADGE_H / 2, bw, ROOM_BADGE_H,
+            with_alpha(region_badge_color[region], dim ? 120 : 235));
+      gfx_font_draw_text(font, bx + 9, item_y + (int)(ROOM_BADGE_FONT * 0.35f),
+            dim ? RGBA8(210, 210, 210, 170) : RGBA8(255, 255, 255, 255), ROOM_BADGE_FONT, label);
+   }
+
+   snprintf(state, sizeof(state), "%s  %u/2", kind_text[kind], room->players >= 2 ? 2u : 1u);
+   sw = gfx_font_text_width(font, ITEM_FONT_SIZE, state);
+   draw_room_text(ONLINE_ITEM_X + ONLINE_ITEM_W - ITEM_TEXT_PAD - sw, y, ITEM_FONT_SIZE, state, dim);
+}
+
+// little up/down chevron at the right edge when the list scrolls
+static void draw_scroll_mark(int cy, bool up)
+{
+   int cx = ONLINE_ITEM_X + ONLINE_ITEM_W + 12;
+
+   for (int i = 0; i < 5; i++)
+   {
+      int w = (up ? i : 4 - i) * 2 + 1;
+      gfx_draw_rectangle(cx - w / 2, cy - 2 + i, w, 1, RGBA8(200, 210, 230, 200));
+   }
+}
+
+// dialog-style box over whatever screen we're on, for everything that's
+// just sitting there waiting on the network
+static void draw_online_box(void (*backdrop)(void), const char *line1, const char *line2,
+      const char *line3, const char *hint)
+{
+   const char *lines[3] = { line1, line2, line3 };
+   int cx = PROMPT_PANEL_X + PROMPT_PANEL_W / 2;
+
+   gfx_begin_frame();
+
+   if (backdrop)
+      backdrop();
+
+   gfx_draw_rectangle(0, 0, SCREEN_W, SCREEN_H, RGBA8(0, 0, 0, 140));
+   draw_prompt_box(PROMPT_PANEL_X, PROMPT_PANEL_Y, PROMPT_PANEL_W, PROMPT_PANEL_H);
+
+   for (int i = 0; i < 3; i++)
+   {
+      if (!lines[i])
+         continue;
+
+      int tw = gfx_font_text_width(font, PROMPT_MSG_FONT_SIZE, lines[i]);
+      draw_text_outline_l(cx - tw / 2, ONLINE_BOX_LINE_Y + i * ONLINE_BOX_LINE_H,
+            PROMPT_MSG_FONT_SIZE, lines[i]);
+   }
+
+   draw_online_bottom_bar(hint, false);
+
+   gfx_end_frame();
+}
+
+// idle callback for the state transfer, same look as the now loading
+// screen the game was just booted behind
+static void draw_online_sync_screen(void)
+{
+   static const char *msg = "Syncing with your opponent...";
+   gfx_texture *cover = cover_tex[games[online_game_idx].known_idx];
+   int tw = gfx_font_text_width(font, ITEM_FONT_SIZE, msg);
+
+   gfx_begin_frame();
+
+   if (loading_bg)
+      gfx_draw_texture(loading_bg, 0, 0);
+   if (cover)
+      gfx_draw_texture(cover, 264, 122);
+
+   draw_text_outline_l((SCREEN_W - tw) / 2, SCREEN_H - 40, ITEM_FONT_SIZE, msg);
+
+   gfx_end_frame();
+}
+
+static void draw_net_banner(const char *line1, const char *line2)
+{
+   int cx = NET_BANNER_X + NET_BANNER_W / 2;
+   int w1 = gfx_font_text_width(font, PROMPT_MSG_FONT_SIZE, line1);
+   int w2 = gfx_font_text_width(font, 16, line2);
+
+   draw_prompt_box(NET_BANNER_X, NET_BANNER_Y, NET_BANNER_W, NET_BANNER_H);
+   draw_text_outline_l(cx - w1 / 2, NET_BANNER_Y + 38, PROMPT_MSG_FONT_SIZE, line1);
+   draw_text_outline_l(cx - w2 / 2, NET_BANNER_Y + 68, 16, line2);
+}
+
+static void draw_online_match_overlay(void)
+{
+   if (online_leave_open)
+      draw_net_banner("Leave the match?", "Cross: leave      Circle: keep playing");
+   else if (online_stalled)
+      draw_net_banner("Waiting for your opponent...", "Press Select to leave");
+}
+
+// gameplay loop for a match. same shape as run_core, except every frame
+// waits until the other vita's input for it has shown up, and select
+// can't open the pause menu since the other player can't be paused along
+// with us. returns NETPLAY_EVENT_NONE if we're the ones who left
+static netplay_event_t run_core_online(void)
+{
+   netplay_event_t ev = NETPLAY_EVENT_NONE;
+   bool quit = false;
+   SceCtrlData pad_prev;
+
+   memset(&pad_prev, 0, sizeof(pad_prev));
+   online_leave_open = false;
+   online_stalled    = false;
+   netplay_active    = true;
+   perf_begin();
+
+   while (!quit)
+   {
+      unsigned pressed = poll_pressed(&pad_prev);
+      update_touch();
+
+      if (online_leave_open)
+      {
+         if (pressed & SCE_CTRL_CROSS)
+         {
+            netplay_log("match: we left");
+            break;
+         }
+         if (pressed & SCE_CTRL_CIRCLE)
+            online_leave_open = false;
+      }
+      else if (pressed & SCE_CTRL_SELECT)
+         online_leave_open = true;
+
+      // the game keeps running under the leave banner, this side just
+      // holds an empty pad until it's dismissed
+      netplay_push_input(online_leave_open ? 0 : local_input_bits());
+
+      SceInt64 wait_start = sceKernelGetProcessTimeWide();
+
+      while ((ev = netplay_poll()) == NETPLAY_EVENT_NONE && !netplay_frame_ready())
+      {
+         if (!online_stalled && sceKernelGetProcessTimeWide() - wait_start >= NET_STALL_BANNER_US)
+            netplay_log("match: stalled waiting on the opponent's input");
+
+         if (sceKernelGetProcessTimeWide() - wait_start < NET_STALL_BANNER_US)
+         {
+            sceKernelDelayThread(1000);
+            continue;
+         }
+
+         online_stalled = true;
+
+         if (tex_w)
+            present_frame(draw_online_match_overlay);
+         else
+            draw_online_sync_screen();
+
+         if (poll_pressed(&pad_prev) & SCE_CTRL_SELECT)
+         {
+            netplay_log("match: we left while stalled");
+            quit = true;
+            break;
+         }
       }
 
-      core_api.deinit();
+      if (online_stalled && ev == NETPLAY_EVENT_NONE && !quit)
+      {
+         netplay_log("match: back in sync after %u ms",
+               (unsigned)((sceKernelGetProcessTimeWide() - wait_start) / 1000));
+         perf_break();
+      }
+
+      online_stalled = false;
+
+      if (quit || ev != NETPLAY_EVENT_NONE)
+         break;
+
+      SceInt64 core_start = sceKernelGetProcessTimeWide();
+      core_api.run();
+      perf_frame(core_start, sceKernelGetProcessTimeWide());
+      netplay_advance();
+
+      if (upload_frame())
+         present_frame(draw_online_match_overlay);
    }
+
+   netplay_active = false;
+   perf_report("online");
+   core_audio_port_close();
+   return ev;
+}
+
+static void online_result_popup(netplay_event_t ev)
+{
+   switch (ev)
+   {
+      case NETPLAY_EVENT_PEER_LEFT:
+         show_two_line_popup("Your opponent left the match.", "Thanks for playing!");
+         break;
+      case NETPLAY_EVENT_TIMEOUT:
+         show_two_line_popup("Lost the connection to your opponent.", "The match has ended.");
+         break;
+      case NETPLAY_EVENT_ERROR:
+         show_two_line_popup("Couldn't sync with your opponent.", "Both need the same ROM and app version.");
+         break;
+      case NETPLAY_EVENT_LOBBY_LOST:
+         show_two_line_popup("Lost the connection to the online lobby.", "Check your connection and try again.");
+         break;
+      default:
+         break;
+   }
+}
+
+// hash of the whole emulated machine right after boot. a core that can't
+// serialize (mame2000) reports size 0 on both sides, nothing to compare
+static bool machine_digest(uint32_t *size, uint8_t digest[NETPLAY_DIGEST_SIZE])
+{
+   size_t n = core_api.serialize_size ? core_api.serialize_size() : 0;
+   void *buf;
+
+   memset(digest, 0, NETPLAY_DIGEST_SIZE);
+   *size = 0;
+
+   if (!n || !core_api.serialize)
+      return true;
+
+   buf = malloc(n);
+   if (!buf)
+      return false;
+
+   if (!core_api.serialize(buf, n))
+   {
+      free(buf);
+      return false;
+   }
+
+   netplay_digest(buf, n, digest);
+   free(buf);
+   *size = (uint32_t)n;
+   return true;
+}
+
+// both sides boot the same rom from the bundled factory nvram, then just
+// compare a hash of the machine they ended up with. nothing from the other
+// vita ever gets loaded into the core, so a hostile opponent has no way
+// to feed it a crafted savestate. the core was fixed up to boot the same
+// way every time (see qs_c.cpp, eeprom.cpp, m68000_intf.cpp, z80_intf.cpp)
+static void run_online_match(int idx, bool is_host)
+{
+   netplay_event_t ev;
+   unsigned delay = netplay_suggested_delay();
+   uint8_t digest[NETPLAY_DIGEST_SIZE];
+   uint32_t size;
+
+   SceInt64 boot_start = sceKernelGetProcessTimeWide();
+
+   online_game_idx = idx;
+   stop_menu_music();
+
+   netplay_log("match: booting %s as %s", pending_rom_file, is_host ? "host" : "guest");
+
+   if (!boot_selected_game(idx, true))
+   {
+      netplay_log("match: core refused %s", pending_rom_file);
+      netplay_close();
+      start_menu_music();
+      return;
+   }
+
+   netplay_log("match: core booted in %u ms",
+         (unsigned)((sceKernelGetProcessTimeWide() - boot_start) / 1000));
+
+   if (!machine_digest(&size, digest))
+   {
+      netplay_log("match: couldn't snapshot our own machine");
+      ev = NETPLAY_EVENT_ERROR;
+   }
+   else
+   {
+      if (!size)
+         netplay_log("match: this core can't serialize, relying on both boots matching");
+
+      if (is_host)
+         ev = netplay_sync_host(size, digest, &delay, draw_online_sync_screen);
+      else
+         ev = netplay_sync_guest(size, digest, draw_online_sync_screen);
+   }
+
+   if (ev == NETPLAY_EVENT_NONE)
+   {
+      netplay_start(delay);
+      ev = run_core_online();
+   }
+   else
+   {
+      core_audio_port_close();
+   }
+
+   netplay_log("match: over (%s)", netplay_event_name(ev));
+
+   netplay_close();
+   shutdown_game();
+   start_menu_music();
+
+   online_result_popup(ev);
+}
+
+// opens a room for this game and sits on it until someone walks in, at
+// which point the match just starts on its own
+static void online_create_room(int idx, int region)
+{
+   char rom[64];
+   char detail[96];
+   char who[64];
+   uint32_t crc;
+   bool joined = false;
+   SceCtrlData pad_prev;
+
+   game_region[idx] = (unsigned char)region;
+
+   if (!resolve_rom_filename(idx, rom, sizeof(rom)))
+   {
+      missing_rom_popup();
+      return;
+   }
+
+   draw_online_box(draw_online_lobby_backdrop, "Checking your ROM...", NULL, NULL, NULL);
+   if (!rom_file_crc(rom, &crc))
+   {
+      missing_rom_popup();
+      return;
+   }
+
+   netplay_create_room(known_games[games[idx].known_idx].base_id, rom, crc);
+   snprintf(detail, sizeof(detail), "%s (%s)", games[idx].label, region_labels[game_region[idx]]);
+   flush_pad(&pad_prev);
+
+   for (;;)
+   {
+      unsigned pressed = poll_pressed(&pad_prev);
+      netplay_event_t ev = netplay_lobby_poll();
+
+      if (ev == NETPLAY_EVENT_JOINED)
+      {
+         joined = true;
+         snprintf(who, sizeof(who), "%.23s joined!", netplay_peer_name());
+         sfx_play(sfx_select_pcm, sfx_select_frames);
+      }
+      else if (ev == NETPLAY_EVENT_PEER_LEFT)
+         joined = false;
+      else if (ev == NETPLAY_EVENT_CONNECTED)
+      {
+         snprintf(pending_rom_file, sizeof(pending_rom_file), "%s", rom);
+         run_online_match(idx, true);
+         return;
+      }
+      else if (ev == NETPLAY_EVENT_LOBBY_LOST)
+      {
+         netplay_close();
+         return;
+      }
+
+      if (pressed & SCE_CTRL_CIRCLE)
+      {
+         sfx_play(sfx_back_pcm, sfx_back_frames);
+         netplay_close();
+         return;
+      }
+
+      if (joined)
+         draw_online_box(draw_online_lobby_backdrop, who, "Starting the match...", detail, NULL);
+      else
+         draw_online_box(draw_online_lobby_backdrop, "Waiting for another player...", detail,
+               "1/2", "Your room is open. Press Circle to close it.");
+   }
+}
+
+static void online_join_room(int idx, const netplay_room_t *room)
+{
+   char line[96];
+   uint32_t crc;
+   SceCtrlData pad_prev;
+   netplay_room_t target = *room;
+
+   if (target.players >= 2)
+   {
+      show_two_line_popup("That room is already full.", "Pick another one or create your own.");
+      return;
+   }
+
+   draw_online_box(draw_online_lobby_backdrop, "Checking your ROM...", NULL, NULL, NULL);
+
+   if (rom_region_of(games[idx].known_idx, target.rom) < 0 || !rom_file_crc(target.rom, &crc))
+   {
+      netplay_log("join: we don't have %s", target.rom);
+      snprintf(line, sizeof(line), "%s%s", ROM_DIR, target.rom);
+      show_two_line_popup("You need this ROM to join:", line);
+      return;
+   }
+
+   if (crc != target.rom_crc)
+   {
+      netplay_log("join: our %s is crc %08x, host's is %08x", target.rom, (unsigned)crc,
+            (unsigned)target.rom_crc);
+      show_two_line_popup("Your copy of this ROM doesn't match", "the host's. Both need the same dump.");
+      return;
+   }
+
+   netplay_join_room(&target, crc);
+   snprintf(line, sizeof(line), "Joining %.23s's room...", target.name);
+   flush_pad(&pad_prev);
+
+   for (;;)
+   {
+      unsigned pressed = poll_pressed(&pad_prev);
+      netplay_event_t ev = netplay_lobby_poll();
+
+      switch (ev)
+      {
+         case NETPLAY_EVENT_CONNECTED:
+            snprintf(pending_rom_file, sizeof(pending_rom_file), "%s", target.rom);
+            run_online_match(idx, false);
+            return;
+
+         case NETPLAY_EVENT_REJECTED:
+            if (netplay_reject_reason() == NETPLAY_REJECT_FULL)
+               show_two_line_popup("Someone else got there first.", "That room is already full.");
+            else if (netplay_reject_reason() == NETPLAY_REJECT_STALE)
+               show_two_line_popup("That room just changed.", "Pick it again from the list.");
+            else
+               show_two_line_popup("The host turned down the connection.", "Both players need the same ROM.");
+            return;
+
+         case NETPLAY_EVENT_TIMEOUT:
+            show_two_line_popup("That room is no longer available.", "Pick another one or create your own.");
+            return;
+
+         case NETPLAY_EVENT_PEER_LEFT:
+            show_two_line_popup("The host closed the room.", "Pick another one or create your own.");
+            return;
+
+         case NETPLAY_EVENT_LOBBY_LOST:
+            netplay_close();
+            return;
+
+         default:
+            break;
+      }
+
+      if (pressed & SCE_CTRL_CIRCLE)
+      {
+         sfx_play(sfx_back_pcm, sfx_back_frames);
+         netplay_close();
+         return;
+      }
+
+      draw_online_box(draw_online_lobby_backdrop, line, games[idx].label, NULL, "Connecting...");
+   }
+}
+
+// which version to host with. straight through when there's only one
+// on the card, a small picker over the room list when there's a choice.
+// -1 means backed out (or nothing to host with)
+#define PICKER_W 440
+
+static int pick_host_region(int idx)
+{
+   unsigned known_idx = games[idx].known_idx;
+   unsigned mask = online_owned[known_idx];
+   int regions[REGION_COUNT];
+   char files[REGION_COUNT][NETPLAY_ROM_LEN];
+   int n = 0, sel = 0;
+   SceCtrlData pad_prev;
+
+   for (int r = 0; r < REGION_COUNT; r++)
+   {
+      if ((mask & (1u << r)) && owned_rom_file(known_idx, r, files[n], sizeof(files[n])))
+      {
+         if (r == game_region[idx])
+            sel = n;
+         regions[n++] = r;
+      }
+   }
+
+   if (n == 0)
+   {
+      missing_rom_popup();
+      return -1;
+   }
+   if (n == 1)
+      return regions[0];
+
+   flush_pad(&pad_prev);
+
+   for (;;)
+   {
+      unsigned pressed = poll_pressed(&pad_prev);
+      int h = 104 + n * ITEM_SPACING_MAIN;
+      int x = (SCREEN_W - PICKER_W) / 2;
+      int y = (BAR_Y - h) / 2 + 10;
+      const char *title = "Host which version?";
+
+      if (netplay_lobby_poll() == NETPLAY_EVENT_LOBBY_LOST)
+         return -1;
+
+      if (pressed & SCE_CTRL_UP)
+         sel = (sel + n - 1) % n;
+      if (pressed & SCE_CTRL_DOWN)
+         sel = (sel + 1) % n;
+      if (pressed & (SCE_CTRL_UP | SCE_CTRL_DOWN))
+         sfx_play(sfx_choose_pcm, sfx_choose_frames);
+
+      if (pressed & SCE_CTRL_CROSS)
+      {
+         sfx_play(sfx_select_pcm, sfx_select_frames);
+         return regions[sel];
+      }
+      if (pressed & SCE_CTRL_CIRCLE)
+      {
+         sfx_play(sfx_back_pcm, sfx_back_frames);
+         return -1;
+      }
+
+      gfx_begin_frame();
+
+      draw_online_lobby_backdrop();
+      gfx_draw_rectangle(0, 0, SCREEN_W, BAR_Y, RGBA8(0, 0, 0, 140));
+      draw_panel_box(x, y, PICKER_W, h);
+
+      draw_text_outline_l(x + (PICKER_W - gfx_font_text_width(font, ONLINE_TITLE_FONT_SIZE, title)) / 2,
+            y + 42, ONLINE_TITLE_FONT_SIZE, title);
+
+      for (int i = 0; i < n; i++)
+      {
+         int item_y = y + 86 + i * ITEM_SPACING_MAIN;
+         int fw = gfx_font_text_width(font, ROOM_BADGE_FONT, files[i]);
+
+         if (i == sel)
+            draw_pause_hilite_at(x + 24, item_y, PICKER_W - 48);
+         draw_item_label_at(x + 24, item_y, PICKER_W - 48, region_labels[regions[i]]);
+         gfx_font_draw_text(font, x + PICKER_W - 24 - ITEM_TEXT_PAD - fw,
+               item_y + (int)(ROOM_BADGE_FONT * 0.35f), RGBA8(200, 210, 230, 220), ROOM_BADGE_FONT, files[i]);
+      }
+
+      draw_online_bottom_bar("Your opponent needs the same version to join.", true);
+
+      gfx_end_frame();
+   }
+}
+
+// joinable rooms first, then ones we're missing the rom for, then matches
+// already being played. stable inside each group, so rooms don't shuffle
+// around as they refresh
+static int sort_rooms(const netplay_room_t *rooms, int count, int *order)
+{
+   int n = 0;
+
+   for (int kind = ROOM_JOINABLE; kind <= ROOM_PLAYING; kind++)
+   {
+      for (int i = 0; i < count; i++)
+      {
+         if ((int)room_kind(&rooms[i]) == kind)
+            order[n++] = i;
+      }
+   }
+
+   return n;
+}
+
+// room browser for one game, every version's rooms in one list: create
+// room up top, everyone else's rooms under it, kept live as they open
+// and close. the highlight follows a room by id, not by position, so a
+// room appearing above it doesn't yank the selection.
+// false means the lobby connection itself is gone
+static bool run_online_lobby(int idx)
+{
+   int sel = 0;
+   int top = 0;
+   char sel_id[NETPLAY_ID_LEN] = "";
+   SceCtrlData pad_prev;
+
+   online_game_idx = idx;
+   room_file_count = 0;
+   snprintf(online_title, sizeof(online_title), "Online: %s", games[idx].label);
+
+   netplay_browse(known_games[games[idx].known_idx].base_id);
+   flush_pad(&pad_prev);
+
+   for (;;)
+   {
+      netplay_room_t rooms[NETPLAY_MAX_ROOMS];
+      int order[NETPLAY_MAX_ROOMS];
+      char hint[96];
+      char summary[64];
+      int count, rows, waiting = 0, playing = 0;
+      unsigned pressed = poll_pressed(&pad_prev);
+
+      if (netplay_lobby_poll() == NETPLAY_EVENT_LOBBY_LOST)
+      {
+         online_result_popup(NETPLAY_EVENT_LOBBY_LOST);
+         return false;
+      }
+
+      count = sort_rooms(rooms, netplay_rooms(rooms, NETPLAY_MAX_ROOMS), order);
+      rows  = count + 1;
+
+      for (int i = 0; i < count; i++)
+      {
+         if (rooms[order[i]].players >= 2)
+            playing++;
+         else
+            waiting++;
+      }
+
+      // stay on the same room if it's still there, wherever it moved to
+      if (sel > 0 && sel_id[0])
+      {
+         int found = -1;
+
+         for (int i = 0; i < count; i++)
+         {
+            if (!strcmp(rooms[order[i]].id, sel_id))
+               found = i + 1;
+         }
+         if (found > 0)
+            sel = found;
+      }
+      if (sel >= rows)
+         sel = rows - 1;
+
+      if (pressed & SCE_CTRL_UP)
+         sel = (sel == 0) ? rows - 1 : sel - 1;
+      if (pressed & SCE_CTRL_DOWN)
+         sel = (sel + 1) % rows;
+      if (pressed & (SCE_CTRL_UP | SCE_CTRL_DOWN))
+         sfx_play(sfx_choose_pcm, sfx_choose_frames);
+
+      if (sel > 0)
+         snprintf(sel_id, sizeof(sel_id), "%s", rooms[order[sel - 1]].id);
+      else
+         sel_id[0] = '\0';
+
+      // keep the highlighted room inside the visible window
+      if (sel > 0 && sel - 1 < top)
+         top = sel - 1;
+      if (sel > 0 && sel - 1 >= top + ONLINE_VISIBLE_ROOMS)
+         top = sel - ONLINE_VISIBLE_ROOMS;
+      if (top > count - ONLINE_VISIBLE_ROOMS)
+         top = (count > ONLINE_VISIBLE_ROOMS) ? count - ONLINE_VISIBLE_ROOMS : 0;
+
+      if (pressed & SCE_CTRL_CROSS)
+      {
+         sfx_play(sfx_select_pcm, sfx_select_frames);
+
+         if (sel == 0)
+         {
+            int region = pick_host_region(idx);
+
+            if (region >= 0)
+               online_create_room(idx, region);
+         }
+         else
+         {
+            online_join_room(idx, &rooms[order[sel - 1]]);
+         }
+
+         online_game_idx = idx;
+         room_file_count = 0;
+         netplay_browse(known_games[games[idx].known_idx].base_id);
+         flush_pad(&pad_prev);
+         continue;
+      }
+
+      if (pressed & SCE_CTRL_CIRCLE)
+      {
+         sfx_play(sfx_back_pcm, sfx_back_frames);
+         netplay_close();
+         return true;
+      }
+
+      if (sel == 0)
+         snprintf(hint, sizeof(hint), "Open a room and wait for an opponent.");
+      else
+      {
+         const netplay_room_t *room = &rooms[order[sel - 1]];
+
+         switch (room_kind(room))
+         {
+            case ROOM_JOINABLE:
+               snprintf(hint, sizeof(hint), "%s", room->relay_only ?
+                     "Join this room. The host plays over the relay." : "Join this room and start the match.");
+               break;
+            case ROOM_NO_ROM:
+               snprintf(hint, sizeof(hint), "You need %s to join this room.", room->rom);
+               break;
+            default:
+               snprintf(hint, sizeof(hint), "This match is already being played.");
+               break;
+         }
+      }
+
+      if (count == 0)
+         summary[0] = '\0';
+      else if (playing == 0)
+         snprintf(summary, sizeof(summary), "%d waiting for an opponent", waiting);
+      else if (waiting == 0)
+         snprintf(summary, sizeof(summary), "%d match%s being played", playing, playing == 1 ? "" : "es");
+      else
+         snprintf(summary, sizeof(summary), "%d waiting for an opponent, %d playing", waiting, playing);
+
+      gfx_begin_frame();
+
+      draw_online_lobby_backdrop();
+
+      if (summary[0])
+      {
+         int tw = gfx_font_text_width(font, ROOM_BADGE_FONT, summary);
+         gfx_font_draw_text(font, ONLINE_PANEL_X + (ONLINE_PANEL_W - tw) / 2, ONLINE_TITLE_Y + 24,
+               RGBA8(170, 184, 210, 255), ROOM_BADGE_FONT, summary);
+      }
+
+      int item_y = ONLINE_ITEM_START_Y;
+
+      if (sel == 0)
+         draw_pause_hilite_at(ONLINE_ITEM_X, item_y, ONLINE_ITEM_W);
+      draw_item_label_at(ONLINE_ITEM_X, item_y, ONLINE_ITEM_W, "Create Room");
+      item_y += ITEM_SPACING_MAIN;
+
+      if (count == 0)
+      {
+         draw_online_note(item_y + ITEM_SPACING_MAIN / 2, "Nobody is hosting this game right now.");
+         draw_online_note(item_y + ITEM_SPACING_MAIN * 3 / 2, "Create a room and your opponent can join it.");
+      }
+
+      for (int i = top; i < count && i < top + ONLINE_VISIBLE_ROOMS; i++)
+      {
+         draw_room_row(item_y, &rooms[order[i]], sel == i + 1);
+         item_y += ITEM_SPACING_MAIN;
+      }
+
+      if (top > 0)
+         draw_scroll_mark(ONLINE_ITEM_START_Y + ITEM_SPACING_MAIN, true);
+      if (top + ONLINE_VISIBLE_ROOMS < count)
+         draw_scroll_mark(ONLINE_ITEM_START_Y + ITEM_SPACING_MAIN * ONLINE_VISIBLE_ROOMS, false);
+
+      {
+         char you[64];
+
+         snprintf(you, sizeof(you), "You appear as %s%s", netplay_local_name(),
+               netplay_hiding_ip() ? ", IP hidden" : "");
+         draw_online_note(ONLINE_PANEL_Y + ONLINE_PANEL_H - 24, you);
+      }
+
+      draw_online_bottom_bar(hint, true);
+
+      gfx_end_frame();
+   }
+}
+
+static void run_online_play(void)
+{
+   netplay_options_t opt = { online_psn_name, online_hide_ip };
+   netplay_init_t init = netplay_init(&opt);
+   SceCtrlData pad_prev;
+
+   if (init == NETPLAY_INIT_NO_WIFI)
+   {
+      show_two_line_popup("Online Play needs an internet connection.", "Connect to Wi-Fi and try again.");
+      return;
+   }
+
+   if (init == NETPLAY_INIT_FAILED)
+   {
+      char code[48];
+
+      snprintf(code, sizeof(code), "Network error 0x%08X", (unsigned)netplay_init_error());
+      show_two_line_popup("Couldn't start the network.", code);
+      return;
+   }
+
+   flush_pad(&pad_prev);
+
+   while (netplay_lobby_state() == NETPLAY_LOBBY_CONNECTING)
+   {
+      if (poll_pressed(&pad_prev) & SCE_CTRL_CIRCLE)
+      {
+         sfx_play(sfx_back_pcm, sfx_back_frames);
+         netplay_shutdown();
+         return;
+      }
+
+      draw_online_box(draw_mainmenu_backdrop, "Connecting to the online lobby...", NULL, NULL,
+            "Press Circle to cancel.");
+   }
+
+   if (netplay_lobby_state() != NETPLAY_LOBBY_ONLINE)
+   {
+      // tls checks the broker certificate's dates against the vita's own
+      // clock, which is the one thing a player can actually fix
+      bool clock = strstr(netplay_lobby_error(), "clock") != NULL;
+
+      netplay_log("lobby: never came online");
+      netplay_shutdown();
+      show_two_line_popup("Couldn't reach the online lobby.",
+            clock ? "Check your Vita's date and time." : "Check your connection and try again.");
+      return;
+   }
+
+   carousel_online = true;
+   refresh_online_owned();
+
+   for (;;)
+   {
+      start_menu_music();
+
+      int idx = run_menu();
+      if (idx < 0 || !run_online_lobby(idx))
+         break;
+   }
+
+   carousel_online = false;
+   netplay_shutdown();
 }
 
 // how long the logo takes to reach full opacity once the title screen boots
@@ -5192,11 +6625,11 @@ static void run_offline_play(void)
 // crop rect for the title backdrop: same cover-fit scale math as
 // cover_src_rect, but vertically panned by u instead of always centered.
 // u=0 shows the top of the image, u=1 shows the bottom, u=0.5 the middle
-static void title_bg_src_rect(vita2d_texture *tex, float dst_w, float dst_h, float u,
+static void title_bg_src_rect(gfx_texture *tex, float dst_w, float dst_h, float u,
       float *sx, float *sy, float *sw, float *sh)
 {
-   float tw = (float)vita2d_texture_get_width(tex);
-   float th = (float)vita2d_texture_get_height(tex);
+   float tw = (float)gfx_texture_get_width(tex);
+   float th = (float)gfx_texture_get_height(tex);
    float scale_x = dst_w / tw;
    float scale_y = dst_h / th;
    float scale = (scale_x > scale_y) ? scale_x : scale_y;
@@ -5223,7 +6656,7 @@ static void draw_title_background(SceInt64 elapsed_us)
    float sx, sy, sw, sh;
    title_bg_src_rect(title_bg_tex, (float)SCREEN_W, (float)SCREEN_H, u, &sx, &sy, &sw, &sh);
 
-   vita2d_draw_texture_part_scale(title_bg_tex, 0.0f, 0.0f,
+   gfx_draw_texture_part_scale(title_bg_tex, 0.0f, 0.0f,
          sx, sy, sw, sh, (float)SCREEN_W / sw, (float)SCREEN_H / sh);
 }
 
@@ -5235,11 +6668,11 @@ static void draw_title_logo(float alpha)
    if (!title_logo_tex)
       return;
 
-   int lw = vita2d_texture_get_width(title_logo_tex);
+   int lw = gfx_texture_get_width(title_logo_tex);
    int x  = (SCREEN_W - lw) / 2;
 
    unsigned tint = RGBA8(255, 255, 255, (unsigned)(alpha + 0.5f));
-   vita2d_draw_texture_tint(title_logo_tex, (float)x, (float)TITLE_LOGO_TOP_PAD, tint);
+   gfx_draw_texture_tint(title_logo_tex, (float)x, (float)TITLE_LOGO_TOP_PAD, tint);
 }
 
 // "press (x) to start" prompt, centered near the bottom. the button
@@ -5250,12 +6683,12 @@ static void draw_title_prompt(void)
    if (!title_banner_tex)
       return;
 
-   int bw = vita2d_texture_get_width(title_banner_tex);
-   int bh = vita2d_texture_get_height(title_banner_tex);
+   int bw = gfx_texture_get_width(title_banner_tex);
+   int bh = gfx_texture_get_height(title_banner_tex);
    int bx = (SCREEN_W - bw) / 2;
    int by = SCREEN_H - TITLE_BANNER_BOTTOM_PAD - bh;
 
-   vita2d_draw_texture(title_banner_tex, (float)bx, (float)by);
+   gfx_draw_texture(title_banner_tex, (float)bx, (float)by);
 }
 
 // title screen, shown once at boot ahead of the game-select menu. cross
@@ -5297,16 +6730,14 @@ static void run_title_screen(void)
 
             unsigned char overlay_alpha = (unsigned char)(fade_t * 255.0f + 0.5f);
 
-            vita2d_start_drawing();
-            vita2d_clear_screen();
+            gfx_begin_frame();
 
             draw_title_background(elapsed);
             draw_title_logo(255.0f);
             draw_title_prompt();
-            vita2d_draw_rectangle(0, 0, SCREEN_W, SCREEN_H, RGBA8(0, 0, 0, overlay_alpha));
+            gfx_draw_rectangle(0, 0, SCREEN_W, SCREEN_H, RGBA8(0, 0, 0, overlay_alpha));
 
-            vita2d_end_drawing();
-            vita2d_swap_buffers();
+            gfx_end_frame();
 
             if (fade_t >= 1.0f)
                break;
@@ -5325,15 +6756,13 @@ static void run_title_screen(void)
       // ramping linearly
       float fade_alpha = fade_t * fade_t * (3.0f - 2.0f * fade_t) * 255.0f;
 
-      vita2d_start_drawing();
-      vita2d_clear_screen();
+      gfx_begin_frame();
 
       draw_title_background(elapsed);
       draw_title_logo(fade_alpha);
       draw_title_prompt();
 
-      vita2d_end_drawing();
-      vita2d_swap_buffers();
+      gfx_end_frame();
    }
 }
 
@@ -5345,22 +6774,28 @@ int main(int argc, char *argv[])
    // --- init: platform, filesystem, core-agnostic assets ---
 
    scePowerSetArmClockFrequency(444);
+
+   // the game thread keeps user core 0 to itself: fbalpha's qsound z80
+   // runs on core 1 and the online relay on core 2
+   sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_0);
+
    sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
    sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
 
    create_data_dirs();
+   load_online_settings();
    reset_core_log();
    migrate_legacy_rom_names();
    seed_default_nvram();
 
-   vita2d_init();
-   vita2d_set_clear_color(RGBA8(0, 0, 0, 255));
+   gfx_init();
+   gfx_set_clear_color(RGBA8(0, 0, 0, 255));
 
-   font = vita2d_load_font_file("app0:assets/fonts/Saira-Regular.ttf");
+   font = gfx_load_font("app0:assets/fonts/Saira-Regular.ttf");
    if (!font)
       debug_log("INIT: failed to load font Saira-Regular.ttf");
 
-   loading_bg = vita2d_load_PNG_file("app0:assets/backgrounds/loadingbackground.png");
+   loading_bg = gfx_load_png("app0:assets/backgrounds/loadingbackground.png");
    if (!loading_bg)
       debug_log("INIT: failed to load loadingbackground.png");
 
@@ -5372,13 +6807,13 @@ int main(int argc, char *argv[])
 
    // --- flow: title screen -> main menu -> offline play (carousel) ---
    //
-   // run_main_menu returns for three cases now: offline play drops into
-   // the existing carousel loop, quit breaks out to the same teardown
-   // path this app has always used, and back-to-title (circle, confirmed
-   // through show_prompt) re-runs the title screen and then drops right
-   // back into the main menu once it's dismissed again. circle from
-   // inside the carousel returns control here without going through any
-   // of those, see run_offline_play/run_menu
+   // run_main_menu returns for four cases now: offline and online play
+   // both drop into the carousel (online then goes on to the lobby), quit
+   // breaks out to the same teardown path this app has always used, and
+   // back-to-title (circle, confirmed through show_prompt) re-runs the
+   // title screen and then drops right back into the main menu once it's
+   // dismissed again. circle from inside the carousel returns control here
+   // without going through any of those, see run_offline_play/run_menu
 
    for (;;)
    {
@@ -5386,6 +6821,8 @@ int main(int argc, char *argv[])
 
       if (action == MAINMENU_OFFLINE_PLAY)
          run_offline_play();
+      else if (action == MAINMENU_ONLINE_PLAY)
+         run_online_play();
       else if (action == MAINMENU_QUIT)
          break;
       else if (action == MAINMENU_ACTION_BACK_TO_TITLE)
@@ -5397,12 +6834,11 @@ int main(int argc, char *argv[])
    free_menu_assets();
 
    if (font)
-      vita2d_free_font(font);
+      gfx_free_font(font);
 
    if (loading_bg)
-      vita2d_free_texture(loading_bg);
+      gfx_free_texture(loading_bg);
 
-   vita2d_fini();
    sceKernelExitProcess(0);
    return 0;
 }

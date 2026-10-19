@@ -4,7 +4,7 @@
 
 ---
 
-**NAOH: Arcade Collection** is a native PlayStation Vita arcade launcher written in C. It statically links the FB Alpha 2012 (CPS2) and MAME 2000 libretro cores behind a custom `vita2d`-rendered front end, so a set of classic Marvel vs Capcom arcade games can be launched and played.
+**NAOH: Arcade Collection** is a native PlayStation Vita arcade launcher written in C. It statically links the FB Alpha 2012 (CPS2) and MAME 2000 libretro cores behind a custom front end drawn with vitaGL, so a set of classic Marvel vs Capcom arcade games can be launched and played.
 
 > [!WARNING]
 > If you own a PS Vita 1000, it is not recommended to use overlays for extended periods, as static images may cause image retention or burn-in on its OLED display. Additionally, use caution with the new wallpaper effects on Vita 1K models, as they can have a greater performance impact.
@@ -81,6 +81,19 @@ Use the images in the `templates/` folder of this repository as sizing guides.
   <img src="screenshots/MainMenu2.0.png" alt="Settings Menu"/>
 </p>
 
+## Online Play (New)
+
+Play against another Vita over the internet. Pick **Online Play** in the main menu, choose a game, then either create a room (you're P1) or join one from the list (you're P2).
+
+* Both players need the **same ROM** (same zip name) and the **same NAOH version**.
+* Rooms are listed through a public MQTT broker (`test.mosquitto.org`, with `broker.emqx.io` as backup) over TLS. Once both sides are in, the Vitas try to connect directly (STUN + UDP hole punching) and fall back to relaying through the broker if that fails.
+* Everything between the two Vitas is encrypted and authenticated with a fresh key per match. Your LAN address is never sent.
+* Both games boot from the same factory NVRAM and their states are hashed and compared before the match starts, so they can't silently desync at boot.
+* **Options → Online Name:** a random nickname (default) or your PSN name.
+* **Options → Hide My IP Online:** relay only, no direct connection, neither side ever sees the other's address. Adds some lag.
+* Press **SELECT** during a match to leave. The game can't pause for one side, so it keeps running.
+* Input delay is picked from the ping (1 to 12 frames). A wired/5 GHz connection on both ends helps a lot.
+
 ## Controls & In-Game Menus
  
 * **Pause Menu:** Press **SELECT**, at any time during gameplay, to pause. From the pause menu you can:
@@ -100,11 +113,13 @@ Use the images in the `templates/` folder of this repository as sizing guides.
 
 This project builds on the work of several open-source and freely licensed projects:
 
-* **FB Alpha 2012 (CPS2 core):** [libretro/fbalpha2012_cps2](https://github.com/libretro/fbalpha2012_cps2) — originally by Dave (finalburn.com) and the FB Alpha team.
+* **FB Alpha 2012:** [libretro/fbalpha2012](https://github.com/libretro/fbalpha2012) — originally by Dave (finalburn.com) and the FB Alpha team.
 * **MAME 2000 core:** [libretro/mame2000-libretro](https://github.com/libretro/mame2000-libretro) — based on MAME 0.37b5.
 * **Font:** [Saira](https://fonts.google.com/specimen/Saira) by Omnibus-Type.
 * **Sound effects:** [Arcade Sound Effects Pack](https://ci.itch.io/arcade-sound-effects-pack) by Chequered Ink.
 * **Ogg decoding:** [stb_vorbis](https://github.com/nothings/stb) by Sean Barrett.
+* **Rendering:** [vitaGL](https://github.com/Rinnegatamante/vitaGL) by Rinnegatamante.
+* **Online play:** [Mbed TLS](https://github.com/Mbed-TLS/mbedtls) and [Monocypher](https://monocypher.org/).
 
 Arcade titles listed above remain the property of their respective copyright holders and are not distributed with this project.
 
@@ -112,7 +127,7 @@ Arcade titles listed above remain the property of their respective copyright hol
 
 The original code in this repository (`main.c`, `Makefile`) is released under the **zlib license** — see [LICENSE](LICENSE).
 
-The compiled `.vpk` statically links the FB Alpha 2012 CPS2 and MAME 2000 cores, both of which are **non-commercial only**. That restriction applies to any build or release of this project regardless of the license on the original code. Font and sound assets carry their own licenses (SIL OFL 1.1 and a free-for-any-use asset license, respectively). Full details, exact license text, and compliance notes for every third-party component are in [NOTICE.md](NOTICE.md) — read it before publishing a release.
+The compiled `.vpk` statically links the FB Alpha 2012 and MAME 2000 cores, both of which are **non-commercial only**. That restriction applies to any build or release of this project regardless of the license on the original code. Font and sound assets carry their own licenses (SIL OFL 1.1 and a free-for-any-use asset license, respectively). Full details, exact license text, and compliance notes for every third-party component are in [NOTICE.md](NOTICE.md) — read it before publishing a release.
 
 ## AI Assistance
 
@@ -120,10 +135,18 @@ Parts of the code were written or improved with the assistance of AI. All AI-ass
 
 ## Building from source (PS Vita)
 
-You'll need [VitaSDK](https://vitasdk.org/) installed and `VITASDK` exported, plus the two core repos checked out under `cores/`:
+You'll need [VitaSDK](https://vitasdk.org/) installed and `VITASDK` exported, plus `git`.
 
 ```bash
-mkdir -p cores
-git clone [https://github.com/libretro/fbalpha2012_cps2](https://github.com/libretro/fbalpha2012_cps2) cores/fbalpha2012_cps2
-git clone [https://github.com/libretro/mame2000-libretro](https://github.com/libretro/mame2000-libretro) cores/mame2000
+cd src
 make -j$(nproc)
+```
+
+The first build does two extra things on its own:
+
+* `cores/fetch.sh` clones FB Alpha 2012 and MAME 2000 at the commits this was built against and applies `cores/*.patch` (determinism fixes needed by online sync, and QSound/CPS1 drawing moved to a second CPU core).
+* vitaGL is cloned into `deps/vitaGL` and built without the boot splash (the splash crashes Vita3K).
+
+Output is `src/naoh_arcade_collection.vpk`. The art in `src/assets` and `src/sce_sys` is placeholder; `make ASSET_ROOT=<dir>` packs the `assets/` and `sce_sys/` from another folder instead (relative path). If you edit the cores later: `drivers/cps1.c` in MAME 2000 includes `vidhrdw/cps1.c` and the core makefile doesn't track that, so delete `cores/mame2000/src/drivers/cps1.o` before rebuilding.
+
+`tools/netplay-harness/` builds the online code for Linux against POSIX stubs so two "Vitas" can be run on a PC (`./build.sh [plain|asan|tsan]`, then `build/<variant>/driver host` and `driver guest`).
