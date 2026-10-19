@@ -21,6 +21,7 @@ unsigned int gfx_texture_get_width(const gfx_texture *tex);
 unsigned int gfx_texture_get_height(const gfx_texture *tex);
 unsigned int gfx_texture_get_stride(const gfx_texture *tex);
 void *gfx_texture_get_datap(const gfx_texture *tex);
+void gfx_texture_set_bgr565(gfx_texture *tex);
 
 void gfx_draw_rectangle(float x, float y, float w, float h, unsigned int color);
 void gfx_draw_texture(const gfx_texture *tex, float x, float y);

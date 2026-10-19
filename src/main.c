@@ -292,6 +292,7 @@ static void bind_core_api(core_kind_t core)
 #define WALLPAPER_COUNT 11 // off + 10 overlay images (ux0:data/NaohAC/overlays/1..10.png)
 
 static gfx_texture *frame_tex = NULL;
+static bool vita3k_colors = false;
 static int current_overlay = 0; // persisted per-game, see game_config_t below
 static gfx_texture *overlay_tex = NULL;
 static unsigned tex_w = 0;
@@ -2140,6 +2141,9 @@ static bool upload_frame(void)
          tex_h = 0;
          return false;
       }
+
+      if (vita3k_colors)
+         gfx_texture_set_bgr565(frame_tex);
 
       tex_w = fb_w;
       tex_h = fb_h;
@@ -4900,7 +4904,8 @@ static void draw_mainmenu_bottom_bar(int sel)
 }
 
 // online privacy settings. a random nickname and direct connections are
-// the defaults; both survive a restart in configs/online.cfg
+// the defaults; both survive a restart in configs/online.cfg, and so does
+// the vita3k color fix (the file kept its name)
 #define ONLINE_CFG_PATH CONFIG_DIR "/online.cfg"
 
 static bool online_psn_name = false;
@@ -4921,6 +4926,8 @@ static void load_online_settings(void)
          online_psn_name = v != 0;
       else if (sscanf(line, "hide_ip=%d", &v) == 1)
          online_hide_ip = v != 0;
+      else if (sscanf(line, "vita3k_colors=%d", &v) == 1)
+         vita3k_colors = v != 0;
    }
 
    fclose(f);
@@ -4933,7 +4940,8 @@ static void save_online_settings(void)
    if (!f)
       return;
 
-   fprintf(f, "psn_name=%d\nhide_ip=%d\n", online_psn_name ? 1 : 0, online_hide_ip ? 1 : 0);
+   fprintf(f, "psn_name=%d\nhide_ip=%d\nvita3k_colors=%d\n", online_psn_name ? 1 : 0,
+         online_hide_ip ? 1 : 0, vita3k_colors ? 1 : 0);
    fclose(f);
 }
 
@@ -4942,7 +4950,7 @@ static void save_online_settings(void)
 // controller_settings_menu uses over the carousel. up/down picks a row,
 // left/right changes it, circle leaves
 #define MAINMENU_OPT_PANEL_W  CTRLCFG_PANEL_W
-#define MAINMENU_OPT_PANEL_H  210
+#define MAINMENU_OPT_PANEL_H  246
 #define MAINMENU_OPT_PANEL_X  CTRLCFG_PANEL_X
 #define MAINMENU_OPT_PANEL_Y  ((SCREEN_H - MAINMENU_OPT_PANEL_H) / 2)
 #define MAINMENU_OPT_ITEM_X   CTRLCFG_ITEM_X
@@ -4950,14 +4958,15 @@ static void save_online_settings(void)
 #define MAINMENU_OPT_ROW_Y    (MAINMENU_OPT_PANEL_Y + 44)
 #define MAINMENU_OPT_NOTE_Y   (MAINMENU_OPT_PANEL_Y + MAINMENU_OPT_PANEL_H - 22)
 
-enum { OPTROW_BGM = 0, OPTROW_NAME, OPTROW_HIDE_IP, OPTROW_COUNT };
+enum { OPTROW_BGM = 0, OPTROW_NAME, OPTROW_HIDE_IP, OPTROW_COLORS, OPTROW_COUNT };
 
 static void mainmenu_options_submenu(void)
 {
    static const char *const notes[OPTROW_COUNT] = {
       "Volume of the music in the menus.",
       "Anonymous gives you a new random nickname each session.",
-      "On: always play through the encrypted relay, a bit more lag."
+      "On: always play through the encrypted relay, a bit more lag.",
+      "Only for Vita3K, fixes red and blue being swapped in games."
    };
    int sel = OPTROW_BGM;
    SceCtrlData pad_prev;
@@ -4994,8 +5003,10 @@ static void mainmenu_options_submenu(void)
          {
             if (sel == OPTROW_NAME)
                online_psn_name = !online_psn_name;
-            else
+            else if (sel == OPTROW_HIDE_IP)
                online_hide_ip = !online_hide_ip;
+            else
+               vita3k_colors = !vita3k_colors;
 
             save_online_settings();
          }
@@ -5033,10 +5044,15 @@ static void mainmenu_options_submenu(void)
             label = "Online Name";
             snprintf(value, sizeof(value), "%s", online_psn_name ? "PSN Name" : "Anonymous");
          }
-         else
+         else if (i == OPTROW_HIDE_IP)
          {
             label = "Hide My IP Online";
             snprintf(value, sizeof(value), "%s", online_hide_ip ? "On" : "Off");
+         }
+         else
+         {
+            label = "Game Colors";
+            snprintf(value, sizeof(value), "%s", vita3k_colors ? "Vita3K" : "Normal");
          }
 
          if (i == sel)

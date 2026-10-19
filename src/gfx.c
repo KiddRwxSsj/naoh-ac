@@ -3,6 +3,7 @@
 #include <string.h>
 #include <png.h>
 #include <ft2build.h>
+#include <psp2/gxm.h>
 #include FT_FREETYPE_H
 
 #include "gfx.h"
@@ -171,6 +172,14 @@ unsigned int gfx_texture_get_width(const gfx_texture *tex)  { return tex->w; }
 unsigned int gfx_texture_get_height(const gfx_texture *tex) { return tex->h; }
 unsigned int gfx_texture_get_stride(const gfx_texture *tex) { return tex->stride; }
 void *gfx_texture_get_datap(const gfx_texture *tex)         { return tex->data; }
+
+// vita3k's opengl renderer reads U5U6U5_RGB with red and blue swapped, the
+// BGR variant comes out right there (and wrong on real hardware)
+void gfx_texture_set_bgr565(gfx_texture *tex)
+{
+   glBindTexture(GL_TEXTURE_2D, tex->id);
+   sceGxmTextureSetFormat(vglGetGxmTexture(GL_TEXTURE_2D), SCE_GXM_TEXTURE_FORMAT_U5U6U5_BGR);
+}
 
 gfx_texture *gfx_load_png(const char *path)
 {
